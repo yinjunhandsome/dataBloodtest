@@ -177,7 +177,8 @@ public class FieldLineage {
                 "fieldName='" + fieldName + '\'' +
                 ", tableName='" + tableName + '\'' +
                 ", fieldType=" + fieldType +
-                ", dependencies=" + dependencies.size() +
+                ", directDeps=" + dependencies.size() +  // 直接依赖数量
+                ", sourceFields=" + getAllSourceFields().size() +  // 源头字段数量
                 '}';
     }
 
