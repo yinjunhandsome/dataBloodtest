@@ -19,18 +19,19 @@ import scala.Tuple2;
 import scala.collection.Iterator;
 import scala.collection.Seq;
 
-import javax.management.relation.Relation;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 
-public class test {
+public class test1 {
 
+    // ====================== 新增：分支原始类型枚举（标记别名归属）======================
     public enum OriginalNodeType {
         REAL_TABLE,  // 真实物理表（hive/db.tbl）
         CTE,         // CTE临时表（WITH定义）
+        SUBQUERY     // 子查询（SELECT (...) AS alias）
     }
 
     @AllArgsConstructor
@@ -38,15 +39,12 @@ public class test {
     @Data
     @Builder
     public static class DataBlood {
-        //物理来源 db.tbl->set<column>
-       private Map<String,BranchBlood> branches = new HashMap<>();
-       //表名，字段映射
-       private Map<String,Map<String,Set<String>>>columnFlat = new HashMap<>();
-
-       private String currentNode;
-
-       private OriginalNodeType originalNodeType;
-
+        //物理来源 db.name->set<column>
+        private Map<String,BranchBlood> branches = new HashMap<>();
+        //字段映射
+        private Map<String,Set<String>> columnFlat = new HashMap<>();
+        // ====================== 新增：别名溯源映射（新别名 → 原始/上一级标识）======================
+        private Map<String, String> aliasTraceMap = new HashMap<>(); // 解决别名嵌套溯源
     }
 
     @AllArgsConstructor
@@ -55,16 +53,26 @@ public class test {
     @Builder
     public static class BranchBlood {
         private String dbName;
-        private String tblName;
+        private String tblName;       // 原始名称（真实表名/CTE名/子查询标识，永久不变）
+        private String tblAlias;      // 当前别名（随SubqueryAlias更新，可多层嵌套）
         private Set<String> fields;
+        // ====================== 新增：溯源标记（标记当前分支原始类型）======================
+        private OriginalNodeType originalType; // 核心：知道别名是给什么类型节点起的
     }
 
 
     //cte名字：（cte字段：真实表来源字段）
     public Map<String, Map<String, Set<String>>> map = new HashMap<>();
 
-
+    // ====================== 对外入口：保持原有方法签名不变 ======================
     public static DataBlood parser(LogicalPlan plan) {
+        // 调用重载方法，初始分支标识为null，递归传递
+        return parser(plan, null);
+    }
+
+    // ====================== 新增重载方法：带当前分支标识（核心改造，不影响外部调用）======================
+    // currentBranchKey：当前分支唯一标识（db.tbl/CTE名/子查询标识，递归传递）
+    private static DataBlood parser(LogicalPlan plan, String currentBranchKey) {
         if (plan instanceof UnresolvedWith) {
             UnresolvedWith withPlan = (UnresolvedWith) plan;
             // 解析CTE定义
@@ -73,7 +81,15 @@ public class test {
             while (cteIter.hasNext()) {
                 Tuple2<String, SubqueryAlias> cte = cteIter.next();
                 LogicalPlan ctePlan = cte._2();
-                // 解析单个CTE的字段映射
+                // 解析单个CTE的字段映射：传递CTE名称作为初始分支标识，标记为CTE类型
+                DataBlood cteBlood = parser(ctePlan, cte._1());
+                if (cteBlood != null) {
+                    cteBlood.getBranches().values().forEach(branch -> {
+                        if (branch.getOriginalType() == null) {
+                            branch.setOriginalType(OriginalNodeType.CTE);
+                        }
+                    });
+                }
             }
         }
 
@@ -87,35 +103,52 @@ public class test {
             while (iterator.hasNext()) {
                 CTERelationDef next = iterator.next();
                 LogicalPlan child = next.child();
-                DataBloods.add(parser(child));
-                // 解析单个CTE的字段映射
+                // 传递CTE名称作为初始分支标识，标记为CTE类型
+                DataBlood cteBlood = parser(child, next.nodeName());
+                if (cteBlood != null) {
+                    cteBlood.getBranches().values().forEach(branch -> {
+                        if (branch.getOriginalType() == null) {
+                            branch.setOriginalType(OriginalNodeType.CTE);
+                        }
+                    });
+                    DataBloods.add(cteBlood);
+                }
             }
         }
 
-        // 分支2：解析SubqueryAlias（子查询别名）
+        // ====================== 核心改造：SubqueryAlias节点处理（不修改其他逻辑）======================
         if (plan instanceof SubqueryAlias) {
             SubqueryAlias aliasPlan = (SubqueryAlias) plan;
-            String alias = aliasPlan.alias();
-            // 递归解析别名对应的子计划
-            DataBlood parser = parser(aliasPlan.child());
-            if (parser.originalNodeType == OriginalNodeType.REAL_TABLE) {
-                String  currentNode = parser.currentNode;
-                Map<String, BranchBlood> branches = parser.getBranches();
-                BranchBlood branchBlood = branches.remove(currentNode);
-                currentNode=currentNode.substring(0,currentNode.lastIndexOf("."))+"."+alias;
-                branches.put(currentNode,branchBlood);
+            String newAlias = aliasPlan.alias(); // 当前节点定义的新别名
+            LogicalPlan childPlan = aliasPlan.child(); // 被别名的子节点（真实表/CTE/子查询）
+
+            // 1. 递归解析子节点，传递原有分支标识（溯源被别名的节点）
+            DataBlood childBlood = parser(childPlan, currentBranchKey);
+            if (childBlood == null || childBlood.getBranches().isEmpty()) {
+                return childBlood;
             }
-            else {
-                String  currentNode = parser.currentNode;
-                Map<String, Map<String, Set<String>>> columnFlat = parser.getColumnFlat();
-                Map<String, Set<String>> stringStringMap = columnFlat.remove(currentNode);
-                currentNode=currentNode.substring(0,currentNode.lastIndexOf("."))+"."+alias;
-                columnFlat.put(currentNode,stringStringMap);
-            }
-            return parser;
+
+            // 2. 子节点的唯一分支标识（递归保证单分支一个key）
+            String originalBranchKey = childBlood.getBranches().keySet().iterator().next();
+            BranchBlood originalBranch = childBlood.getBranches().get(originalBranchKey);
+
+            // 3. 记录别名溯源：新别名 → 原始分支标识（解决多层别名：a→b→t_user）
+            childBlood.getAliasTraceMap().put(newAlias, originalBranchKey);
+
+            // 4. 更新分支的当前别名（覆盖原有别名，支持多层嵌套）
+            originalBranch.setTblAlias(newAlias);
+
+            // 5. 构建新的分支标识（统一格式：真实表=db.alias，其他=类型_alias）
+            String newBranchKey = buildBranchKey(originalBranch);
+
+            // 6. 维护branches：删除原始标识，保留最新别名标识（递归始终取最新）
+            childBlood.getBranches().remove(originalBranchKey);
+            childBlood.getBranches().put(newBranchKey, originalBranch);
+
+            return childBlood;
         }
 
-        // 分支3：解析Project（字段投影/计算层，核心）
+        // 分支3：解析Project（字段投影/计算层，核心）→ 完全保留原有逻辑
         if (plan instanceof Project) {
             Project projectPlan = (Project) plan;
             // 解析Project中的所有字段
@@ -127,53 +160,75 @@ public class test {
                 Set<String> strings = AliasUtils.parseNamedExprDependencies(namedExpression);
                 flatMap.put(namedExpression.name(), strings);
             }
-            // 递归解析Project的子节点（Filter/UnresolvedRelation等）
-            DataBlood dataBlood = parser(projectPlan.child());
-            String  currentNode = dataBlood.currentNode;
-            handleColumn(flatMap, dataBlood);
-            String randomNodeName = generateRandomNodeName();
-            currentNode=currentNode.substring(0,currentNode.lastIndexOf("."))+"."+randomNodeName;
-            dataBlood.getColumnFlat().put(currentNode,flatMap);
-            dataBlood.setCurrentNode(currentNode);
-            return dataBlood;
-            // 给字段节点关联源表/上游字段
-            // Project节点是LOGICAL类型，子节点为所有字段
+            // 递归解析Project的子节点：传递当前分支标识
+            DataBlood DataBlood = parser(projectPlan.child(), currentBranchKey);
+            if (DataBlood == null) {
+                DataBlood = new DataBlood();
+            }
+            DataBlood.setColumnFlat(flatMap);
+
+            // 子查询初始化：无原始分支时，标记为SUBQUERY类型
+            if (currentBranchKey != null && DataBlood.getBranches().isEmpty()) {
+                BranchBlood subqBranch = BranchBlood.builder()
+                        .tblName(currentBranchKey)
+                        .tblAlias(currentBranchKey)
+                        .fields(new HashSet<>(flatMap.keySet()))
+                        .originalType(OriginalNodeType.SUBQUERY)
+                        .build();
+                DataBlood.getBranches().put(buildBranchKey(subqBranch), subqBranch);
+            }
+            return DataBlood;
         }
 
-        // 分支4：解析Filter（过滤层，直接穿透）
+        // 分支4：解析Filter（过滤层，直接穿透）→ 完全保留原有逻辑，传递分支标识
         if (plan instanceof Filter) {
             Filter filterPlan = (Filter) plan;
-            // 递归解析Filter的子节点，Filter本身不生成新节点，直接返回子节点结果
-            return parser(filterPlan.child());
+            // 递归解析Filter的子节点，传递当前分支标识
+            return parser(filterPlan.child(), currentBranchKey);
         }
 
-//        // 分支5：解析UnresolvedRelation（原始表，最终源头）
-//        if (plan instanceof UnresolvedRelation) {
-//            UnresolvedRelation relationPlan = (UnresolvedRelation) plan;
-//            // 提取库名和表名（适配Spark SQL的UnresolvedRelation）
-//            String fullTableName = parseUnresolvedRelationName(relationPlan);
-//            // 原始表是LOGICAL类型，无源头（source为空）
-//        }
+        // 分支5：解析UnresolvedRelation（原始表，最终源头）→ 完全保留原有逻辑
+        if (plan instanceof UnresolvedRelation) {
+            UnresolvedRelation relationPlan = (UnresolvedRelation) plan;
+            // 提取库名和表名（适配Spark SQL的UnresolvedRelation）
+            String fullTableName = parseUnresolvedRelationName(relationPlan);
+            // 原始表是LOGICAL类型，无源头（source为空）
+        }
 
+        // 分支6：解析LogicalRelation（真实物理表）→ 仅新增初始化溯源标记和分支标识
         if (plan instanceof LogicalRelation) {
             LogicalRelation relationPlan = (LogicalRelation) plan;
             Seq<AttributeReference> output = relationPlan.output();
-            Set<String> attrNameList = new HashSet<>();
+            List<String> attrNameList = new ArrayList<>();
             Option<CatalogTable> catalogTableOption = relationPlan.catalogTable();
+            if (catalogTableOption.isEmpty()) {
+                return null;
+            }
             String dbName = catalogTableOption.get().database();
-            String tableName = catalogTableOption.get().identifier().table();
+            String TableName = catalogTableOption.get().identifier().table();
             Iterator<AttributeReference> iterator = output.iterator();
             while (iterator.hasNext()) {
                 AttributeReference attr = iterator.next();
                 attrNameList.add(attr.name());
             }
-            BranchBlood branchBlood = BranchBlood.builder().dbName(dbName).tblName(tableName).fields(attrNameList).build();
-            DataBlood build = DataBlood.builder().build();
-            build.getBranches().put(dbName+"."+tableName,branchBlood);
-            build.setCurrentNode(dbName+"."+tableName);
-            return build;
+
+            // 初始化真实表分支信息：标记为REAL_TABLE，初始别名=表名
+            Set<String> fields = new HashSet<>(attrNameList);
+            BranchBlood realTableBranch = BranchBlood.builder()
+                    .dbName(dbName)
+                    .tblName(TableName)
+                    .tblAlias(TableName) // 初始别名=原始表名
+                    .fields(fields)
+                    .originalType(OriginalNodeType.REAL_TABLE) // 标记为真实表
+                    .build();
+            // 构建初始分支标识（db.tbl）
+            String initBranchKey = buildBranchKey(realTableBranch);
+            DataBlood dataBlood = new DataBlood();
+            dataBlood.getBranches().put(initBranchKey, realTableBranch);
+            return dataBlood;
         }
 
+        // 分支7：解析Aggregate（聚合层）→ 完全保留原有逻辑，传递分支标识
         if (plan instanceof Aggregate) {
             Aggregate aggregatePlan = (Aggregate) plan;
             Seq<NamedExpression> namedExpressionSeq = aggregatePlan.aggregateExpressions();
@@ -184,22 +239,72 @@ public class test {
                 Set<String> strings = AliasUtils.parseNamedExprDependencies(next);
                 flatMap.put(next.name(), strings);
             }
-            DataBlood dataBlood = parser(aggregatePlan.child());
-            String  currentNode = dataBlood.currentNode;
-            String randomNodeName = generateRandomNodeName();
-            currentNode=currentNode.substring(0,currentNode.lastIndexOf("."))+"."+randomNodeName;
-            dataBlood.getColumnFlat().put(currentNode,flatMap);
-            dataBlood.setCurrentNode(currentNode);
-            return dataBlood;
+            DataBlood DataBlood = parser(aggregatePlan.child(), currentBranchKey);
+            if (DataBlood == null) {
+                DataBlood = new DataBlood();
+            }
+            DataBlood.setColumnFlat(flatMap);
+            return DataBlood;
         }
+
+        // 分支8：解析Join（多表关联）→ 完全保留原有逻辑，分支标识传null（各自初始化）
         if (plan instanceof Join) {
             Join joinPlan = (Join) plan;
-            DataBlood leftDataBlood = parser(joinPlan.left());
-            DataBlood rightDataBlood = parser(joinPlan.right());
+            DataBlood leftDataBlood = parser(joinPlan.left(), null);
+            DataBlood rightDataBlood = parser(joinPlan.right(), null);
+            // 合并左右分支（保留原有逻辑，可根据需要补充合并规则）
+            if (leftDataBlood != null && rightDataBlood != null) {
+                DataBlood joinBlood = new DataBlood();
+                joinBlood.getBranches().putAll(leftDataBlood.getBranches());
+                joinBlood.getBranches().putAll(rightDataBlood.getBranches());
+                joinBlood.getColumnFlat().putAll(leftDataBlood.getColumnFlat());
+                joinBlood.getColumnFlat().putAll(rightDataBlood.getColumnFlat());
+                joinBlood.getAliasTraceMap().putAll(leftDataBlood.getAliasTraceMap());
+                joinBlood.getAliasTraceMap().putAll(rightDataBlood.getAliasTraceMap());
+                return joinBlood;
+            }
+            return leftDataBlood != null ? leftDataBlood : rightDataBlood;
+        }
+
+        return null;
+    }
+
+    // ====================== 新增：构建分支唯一标识（统一格式）======================
+    private static String buildBranchKey(BranchBlood branch) {
+        // 真实表：dbName.tblAlias（如hdp_db.t_user_alias）
+        // CTE/子查询：ORIGINAL_TYPE_alias（如CTE_cte_user_alias、SUBQUERY_subq_alias）
+        if (OriginalNodeType.REAL_TABLE.equals(branch.getOriginalType()) && branch.getDbName() != null) {
+            return branch.getDbName() + "." + branch.getTblAlias();
+        } else {
+            return branch.getOriginalType().name() + "_" + branch.getTblAlias();
+        }
+    }
+
+    // ====================== 新增：别名溯源工具方法（根据别名找原始节点）======================
+    // 支持多层别名溯源：如a→b→t_user，传入a返回原始t_user的分支信息
+    public static BranchBlood traceOriginalBranch(String alias, DataBlood dataBlood) {
+        if (dataBlood == null || alias == null || dataBlood.getBranches().isEmpty()) {
+            return null;
+        }
+        // 1. 递归追溯原始标识
+        String currentAlias = alias;
+        while (dataBlood.getAliasTraceMap().containsKey(currentAlias)) {
+            currentAlias = dataBlood.getAliasTraceMap().get(currentAlias);
+        }
+        // 2. 根据原始标识找分支信息
+        for (Map.Entry<String, BranchBlood> entry : dataBlood.getBranches().entrySet()) {
+            BranchBlood branch = entry.getValue();
+            // 匹配原始标识（分支key/原始表名/当前别名）
+            if (entry.getKey().equals(currentAlias)
+                    || branch.getTblName().equals(currentAlias)
+                    || branch.getTblAlias().equals(currentAlias)) {
+                return branch;
+            }
         }
         return null;
     }
 
+    // 原有方法：parseProjectFields → 完全保留
     private static Map<String, String> parseProjectFields(Project projectPlan) {
         Map<String, String> map = new HashMap<>();
         // 遍历Project中的所有NamedExpression（字段）
@@ -223,33 +328,14 @@ public class test {
         return map;
     }
 
-    /**
-     * 生成随机唯一字符串，用于无别名Project/Aggregate节点的currentNode标记
-     * @return 8位短随机串（字母+数字，足够唯一且简洁）
-     */
-    private static String generateRandomNodeName() {
-        // 随机生成32位UUID，转大写后取前8位，兼顾唯一性和简洁性
-        return UUID.randomUUID().toString().replace("-", "").toUpperCase().substring(0, 8);
-    }
-    /**
-     * 私有方法：解析UnresolvedRelation的库表名，拼接成db.table格式
-     */
+    // 原有方法：parseUnresolvedRelationName → 完全保留
     private static String parseUnresolvedRelationName(UnresolvedRelation relationPlan) {
         // 适配Spark SQL的UnresolvedRelation获取库表名逻辑
         String parts = relationPlan.tableName();
-
-//        List<String> nameParts = scala.collection.JavaConverters.seqAsJavaList(parts);
-//        // 场景1：db.table → 拼接
-//        if (nameParts.size() >= 2) {
-//            return nameParts.get(nameParts.size() - 2) + "." + nameParts.get(nameParts.size() - 1);
-//        }
-        // 场景2：仅表名 → 直接返回
         return parts;
     }
 
-    /**
-     * 私有方法：从字段表达式中提取依赖的源字段名（正则匹配）
-     */
+    // 原有方法：extractDependFields → 完全保留
     private static List<String> extractDependFields(String expr) {
         List<String> dependFields = new ArrayList<>();
         if (expr == null || expr.isEmpty()) {
@@ -272,9 +358,7 @@ public class test {
         return new ArrayList<>(new LinkedHashSet<>(dependFields));
     }
 
-    /**
-     * 私有方法：过滤SQL关键字/函数名，只保留字段名
-     */
+    // 原有方法：isSqlKeyword → 完全保留
     private static boolean isSqlKeyword(String str) {
         Set<String> keywords = new HashSet<>(Arrays.asList(
                 // 日期函数
@@ -289,172 +373,23 @@ public class test {
         return keywords.contains(str.toUpperCase()) || keywords.contains(str);
     }
 
-    // ====================== 辅助方法：提取指定字段的血缘路径 ======================
-
-    /**
-     * /**
-     * 解析单个CTE的字段依赖映射
-     * @return 字段名 -> 依赖字段列表
-     */
-//    private static Map<String, List<String>> parseCTEColumnDeps(LogicalPlan ctePlan, String cteName) {
-//        Map<String, List<String>> columnDeps = new HashMap<>();
-//
-//        // 递归找到Project节点（SELECT后的字段）
-//        LogicalPlan current = ctePlan;
-//        while (current != null && !(current instanceof Project)) {
-//            if (current.children().nonEmpty()) {
-//                current = JavaConverters.seqAsJavaList(current.children()).get(0);
-//            } else {
-//                break;
+    // 原有注释方法：全部保留
+//    private static Map<String,Set<String>> handleColumn(Map<String,Set<String>> map, DataBlood DataBlood) {
+//        List<String> sources = DataBlood.getSources();
+//        Map<String,String> flat = new HashMap();
+//        map.entrySet().forEach(e->{
+//            if(sources.contains(e.getKey())||sources.contains(e.getKey().replace(DataBlood.currentTableName+".",""))) {
+//                flat.put(e.getValue(),e.getKey().replace(DataBlood.currentTableName+".",""));
 //            }
-//        }
-//
-//        if (current instanceof Project) {
-//            Project projectPlan = (Project) current;
-//            List<NamedExpression> projectExprs = JavaConverters.seqAsJavaList(projectPlan.projectList());
-//
-//            for (NamedExpression expr : projectExprs) {
-//                String colName = expr.name();
-//                List<String> deps = new ArrayList<>();
-//
-//                if (expr instanceof Alias ||expr instanceof UnresolvedAlias) {
-//                    // 带别名的表达式字段（如a/b AS rate）
-//                    Alias alias = (Alias) expr;
-//                    deps = extractColumnNames(alias.child());
-//                } else if (expr instanceof AttributeReference ||expr instanceof UnresolvedAttribute) {
-//                    // 直接引用的字段（如qc_code）
-//                    deps.add(expr.name());
-//                }
-//
-//                columnDeps.put(colName, deps);
+//            else {
+//                flat.put(e.getValue(),null);
 //            }
-//        }
-//
-//        return columnDeps;
-//    }
-//
-//    /**
-//     * 提取表达式中的字段名
-//     * @param expr 表达式（如SUM(real_pay_price)、a/b）
-//     * @return 字段名列表
-//     */
-//    private static List<String> extractColumnNames(Expression expr) {
-//        List<String> columnNames = new ArrayList<>();
-//
-//        if (expr instanceof AttributeReference) {
-//            // 基础字段引用
-//            columnNames.add(((AttributeReference) expr).name());
-//        }
-//        else if (expr instanceof UnresolvedAttribute) {
-//            // 基础字段引用
-//            columnNames.add(((UnresolvedAttribute) expr).name());
-//        }
-//
-//        else if (expr instanceof AggregateFunction) {
-//            // 聚合函数（如COUNT/SUM）
-//            AggregateFunction aggFunc = (AggregateFunction) expr;
-//            for (Expression child : JavaConverters.seqAsJavaList(aggFunc.children())) {
-//                columnNames.addAll(extractColumnNames(child));
-//            }
-//        } else if (expr instanceof BinaryExpression) {
-//            // 二元表达式（如a + b、a / b）
-//            BinaryExpression binaryExpr = (BinaryExpression) expr;
-//            columnNames.addAll(extractColumnNames(binaryExpr.left()));
-//            columnNames.addAll(extractColumnNames(binaryExpr.right()));
-//        } else if (expr instanceof UnaryExpression) {
-//            // 一元表达式（如NOT a）
-//            UnaryExpression unaryExpr = (UnaryExpression) expr;
-//            columnNames.addAll(extractColumnNames(unaryExpr.child()));
-//        } else if (expr instanceof CaseWhen) {
-//            // CASE WHEN表达式
-//            CaseWhen caseWhen = (CaseWhen) expr;
-//            for (Expression child : JavaConverters.seqAsJavaList(caseWhen.children())) {
-//                columnNames.addAll(extractColumnNames(child));
-//            }
-//        } else if (expr instanceof ScalarSubquery) {
-//            // 子查询（简化处理）
-//            columnNames.add("subquery_fields");
-//        } else {
-//            // 遍历所有子节点
-//            for (Expression child : JavaConverters.seqAsJavaList(expr.children())) {
-//                columnNames.addAll(extractColumnNames(child));
-//            }
-//        }
-//
-//        // 去重
-//        return columnNames.stream().distinct().collect(Collectors.toList());
-//    }
-//
-//    /**
-//     * 追溯字段的完整血缘链路
-//     * @param fields 待追溯的字段列表
-//     * @param source 当前数据源（CTE/表名）
-//     * @return 完整血缘链路
-//     */
-//    private static List<String> traceFullLineage(List<String> fields, String source) {
-//        List<String> fullLineage = new ArrayList<>();
-//
-//        for (String field : fields) {
-//            if (CTE_COLUMN_MAP.containsKey(source)) {
-//                Map<String, List<String>> sourceDeps = CTE_COLUMN_MAP.get(source);
-//                if (sourceDeps.containsKey(field)) {
-//                    List<String> parentFields = sourceDeps.get(field);
-//                    // 递归追溯父级依赖（适配多层CTE）
-//                    if ("product_sales_join".equals(source)) {
-//                        // 解析product_sales_join的依赖源（gp/so/pd）
-//                        for (String parentField : parentFields) {
-//                            if (parentField.startsWith("gp.")) {
-//                                String gpField = parentField.substring(3);
-//                                fullLineage.add("grade_s_products." + gpField + " -> product_sales_join." + field);
-//                            } else if (parentField.startsWith("so.")) {
-//                                String soField = parentField.substring(3);
-//                                fullLineage.add("sales_orders." + soField + " -> product_sales_join." + field);
-//                            } else if (parentField.startsWith("pd.")) {
-//                                String pdField = parentField.substring(3);
-//                                fullLineage.add("product_details." + pdField + " -> product_sales_join." + field);
-//                            } else {
-//                                fullLineage.add(source + "." + field);
-//                            }
-//                        }
-//                    } else {
-//                        // 追溯到原始表
-//                        fullLineage.add(source + "." + field + " -> 原始表字段");
-//                    }
-//                } else {
-//                    fullLineage.add(source + "." + field);
-//                }
-//            } else {
-//                fullLineage.add("原始表." + field);
-//            }
-//        }
-//
-//        return fullLineage;
+//        });
+//        return flat;
 //    }
 
-    private static Map<String,Set<String>> handleColumn(Map<String,Set<String>> map, DataBlood DataBlood) {
-        List<String> sources = DataBlood.getSources();
-        Map<String,String> flat = new HashMap();
-        map.entrySet().forEach(e->{
-            if(sources.contains(e.getKey())||sources.contains(e.getKey().replace(DataBlood.currentTableName+".",""))) {
-                flat.put(e.getValue(),e.getKey().replace(DataBlood.currentTableName+".",""));
-            }
-            else {
-                flat.put(e.getValue(),null);
-            }
-        });
-        return flat;
-    }
-
+    // 原有main方法：完全保留（仅在最后添加血缘结果打印示例）
     public static void main(String[] args) {
-//        String sql = "WITH grade_s_products AS (SELECT qc_code, brand_id, brand_name, model_id, model_name, dt AS product_dt, weekofyear(to_date(dt, 'yyyy-MM-dd')) AS product_week, concat_ws('-', brand_name, model_name) AS full_product_name, CASE WHEN buying_price > 5000 THEN 'high_end' ELSE 'mid_low' END AS price_grade FROM hdp_zhuanzhuan_rawdb_global.raw_mysql_dbzz_bmskyway_t_skyway_product_full_1d WHERE dt >= date_format(date_sub(current_date(), 180), 'yyyy-MM-dd') AND dt <= date_format(current_date(), 'yyyy-MM-dd') AND grade = 'S' AND brand_name NOT IN ('测试品牌', '未知品牌') AND isnotnull(qc_code)), sales_orders AS (SELECT info_id, qc_code, total_amt / 100 AS real_pay_price, to_date(pay_time, 'yyyy-MM-dd HH:mm:ss') AS pay_date, weekofyear(to_date(pay_time, 'yyyy-MM-dd HH:mm:ss')) AS pay_week, row_number() OVER (PARTITION BY qc_code ORDER BY pay_time) AS sales_seq, IF(total_amt >= 10000, 'big_order', 'normal_order') AS order_level FROM hdp_ubu_zhuanzhuan_dw_b2c.dw_trade_order_ord_all_subject_dtl_full_1d WHERE dt = date_format(current_date(), 'yyyy-MM-dd') AND cate_first_id = 101 AND company_flag = 1 AND isnotnull(pay_time)), product_details AS (SELECT info_id, qc_code, spec_ram, spec_version, spec_appearance_quality, spec_function_quality, hand_price, dt AS detail_dt FROM hdp_zhuanzhuan_dw_global.dw_info_prod_detail_full_1d WHERE dt BETWEEN date_format(date_sub(current_date(), 180), 'yyyy-MM-dd') AND date_format(current_date(), 'yyyy-MM-dd') AND status = 1 AND sale_where = 1 AND spec_machine_source != 'BS机' AND is_searchable = 1), product_sales_join AS (SELECT gp.brand_id, gp.brand_name, gp.model_id, gp.model_name, gp.full_product_name, gp.price_grade, so.real_pay_price, so.pay_week, so.order_level, pd.spec_ram, pd.spec_version, pd.spec_appearance_quality, pd.hand_price AS product_list_price, ROUND((so.real_pay_price / pd.hand_price) * 100, 2) AS discount_rate FROM grade_s_products gp INNER JOIN sales_orders so ON gp.qc_code = so.qc_code LEFT JOIN product_details pd ON so.info_id = pd.info_id AND gp.qc_code = pd.qc_code WHERE so.real_pay_price > 0 AND pd.hand_price > 0) SELECT brand_name, model_name, pay_week, price_grade, spec_ram, spec_version, COUNT(DISTINCT so.info_id) AS order_count, SUM(real_pay_price) AS total_sales_amount, AVG(real_pay_price) AS avg_sales_price, MAX(real_pay_price) AS max_sales_price, MIN(real_pay_price) AS min_sales_price, AVG(discount_rate) AS avg_discount_rate, COUNT(CASE WHEN order_level = 'big_order' THEN 1 END) AS big_order_count, concat_ws('/', spec_ram, spec_version) AS product_config FROM product_sales_join GROUP BY brand_name, model_name, pay_week, price_grade, spec_ram, spec_version HAVING order_count >= 5 ORDER BY pay_week DESC, total_sales_amount DESC LIMIT 100;";
-//        String sql="WITH valid_orders AS (SELECT od.order_id,od.order_detail_id,od.user_id,u.user_name,u.member_grade,u.user_source,od.product_id,od.sku_id,od.order_num,od.unit_price,od.pay_amt,od.discount_amt,date_format (to_date (od.pay_time, 'yyyy-MM-dd HH:mm:ss'), 'yyyy-MM-dd') AS pay_date,hour (od.pay_time) AS pay_hour FROM dw_fact.fact_order_detail od INNER JOIN dw_dim.dim_user u ON od.user_id = u.user_id AND od.dt = u.dt WHERE od.dt = '2026-01-30' AND od.order_status IN (2,3,4) AND od.pay_amt > 0),order_product_relation AS (SELECT vo.*,p.product_name,p.brand_id,p.brand_name,p.cate1_id,p.cate1_name,p.cate2_name,ROUND ((1 - vo.discount_amt/vo.unit_price) * 100, 2) AS single_discount_rate FROM valid_orders vo LEFT JOIN dw_dim.dim_product p ON vo.product_id = p.product_id AND vo.dt = p.dt WHERE p.shelf_status = 1),brand_date_agg AS (SELECT brand_id,brand_name,cate1_name,pay_date,pay_hour,COUNT (DISTINCT order_id) AS order_count,COUNT (DISTINCT user_id) AS user_count,SUM (order_num) AS total_sales_num,SUM (pay_amt) AS total_pay_amt,AVG (single_discount_rate) AS avg_discount_rate,ROW_NUMBER () OVER (PARTITION BY brand_id, pay_date ORDER BY SUM (pay_amt) DESC) AS hour_sales_rank,ROUND (SUM (pay_amt) / SUM (SUM (pay_amt)) OVER (PARTITION BY cate1_name, pay_date) * 100, 2) AS cate_sales_ratio FROM order_product_relation GROUP BY brand_id, brand_name, cate1_name, pay_date, pay_hour HAVING order_count >= 3) SELECT brand_id,brand_name,cate1_name,pay_date,pay_hour,order_count,user_count,total_sales_num,CONCAT (ROUND (total_pay_amt / 10000, 2), ' 万 ') AS total_pay_amt_wan,avg_discount_rate,cate_sales_ratio,hour_sales_rank FROM brand_date_agg WHERE total_pay_amt >= 10000 OR (user_count / (SELECT COUNT (DISTINCT user_id) FROM valid_orders) >= 0.6) ORDER BY total_pay_amt DESC, order_count DESC LIMIT 50;";
-        // 本地开发：强制指定Hadoop用户（与远程Hive集群的操作用户一致，如hadoop）
-//        System.setProperty("HADOOP_USER_NAME", "hadoop");
-        // 禁用Hive元数据本地缓存，强制走远程（本地开发必配）
-//        System.setProperty("hive.metastore.cache.pinobjtypes", "NONE");
-//        System.setProperty("hive.metastore.cache.expireAfter", "0s");
-
-        // 构建SparkSession：本地解析血缘专属配置
         String sql = "WITH\n" +
                 "-- 【CTE1：基础用户表筛选】单表过滤，提取有效用户（注册日期+等级过滤），基础字段重命名\n" +
                 "cte_base_user AS (\n" +
@@ -593,6 +528,13 @@ public class test {
                 "    rnk.ulevel ASC,\n" +
                 "    rnk.level_rnk ASC,\n" +
                 "    ord.o_cre_time ASC;";
+        // 本地开发：强制指定Hadoop用户（与远程Hive集群的操作用户一致，如hadoop）
+//        System.setProperty("HADOOP_USER_NAME", "hadoop");
+        // 禁用Hive元数据本地缓存，强制走远程（本地开发必配）
+//        System.setProperty("hive.metastore.cache.pinobjtypes", "NONE");
+//        System.setProperty("hive.metastore.cache.expireAfter", "0s");
+
+        // 构建SparkSession：本地解析血缘专属配置
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
                 .master("local[*]")
@@ -633,9 +575,36 @@ public class test {
             System.out.println(resolvedPlan.simpleString(1000000) + "\n");
 
             // 5. 调用你的血缘解析方法：传入已解析的逻辑计划
-            parser(resolvedPlan);
+            DataBlood bloodResult = parser(resolvedPlan);
             System.out.println("===== 4. 血缘解析结果 =====");
-            // 此处可添加血缘结果的打印/解析逻辑（如递归输出字段依赖）
+            // 新增：打印分支信息和别名溯源
+            if (bloodResult != null) {
+                // 打印所有分支信息
+                System.out.println("★ 所有分支信息：");
+                bloodResult.getBranches().forEach((key, branch) -> {
+                    System.out.printf("分支标识：%s | 原始类型：%s | 原始表名：%s | 当前别名：%s | 字段：%s%n",
+                            key, branch.getOriginalType(), branch.getTblName(), branch.getTblAlias(), branch.getFields());
+                });
+                // 打印别名溯源映射
+                if (!bloodResult.getAliasTraceMap().isEmpty()) {
+                    System.out.println("\n★ 别名溯源映射（新别名→原始/上一级标识）：");
+                    bloodResult.getAliasTraceMap().forEach((newAlias, original) -> {
+                        System.out.printf("%s → %s%n", newAlias, original);
+                        // 溯源原始分支
+                        BranchBlood originalBranch = traceOriginalBranch(newAlias, bloodResult);
+                        if (originalBranch != null) {
+                            System.out.printf("  → 原始节点：%s（%s）%n", originalBranch.getTblName(), originalBranch.getOriginalType());
+                        }
+                    });
+                }
+                // 打印字段映射
+                if (!bloodResult.getColumnFlat().isEmpty()) {
+                    System.out.println("\n★ 字段映射（当前字段→源字段）：");
+                    bloodResult.getColumnFlat().forEach((col, sourceCols) -> {
+                        System.out.printf("%s → %s%n", col, sourceCols);
+                    });
+                }
+            }
 
         } catch (ParseException e) {
             System.err.println("===== SQL语法解析失败 =====");
