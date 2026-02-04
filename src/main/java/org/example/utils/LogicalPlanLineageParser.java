@@ -379,8 +379,21 @@ public class LogicalPlanLineageParser {
 
                 // 判断字段类型
                 if (expr instanceof Alias) {
-                    lineage.setFieldType(FieldLineage.FieldType.ALIAS);
                     Alias alias = (Alias) expr;
+                    // 根据child的实际类型判断字段类型:
+                    // - AttributeReference: 简单重命名 → ALIAS
+                    // - Literal: 常量赋值 → CONSTANT (但用户可能期望CALCULATED)
+                    // - 其他表达式(CAST/函数等): 计算字段 → CALCULATED
+                    Expression child = alias.child();
+                    if (child instanceof AttributeReference) {
+                        lineage.setFieldType(FieldLineage.FieldType.ALIAS);
+                    } else if (child instanceof Literal) {
+                        lineage.setFieldType(FieldLineage.FieldType.LITERAL);
+                    } else {
+                        // CAST、函数调用等计算表达式
+                        lineage.setFieldType(FieldLineage.FieldType.CALCULATED);
+                    }
+
                     try {
                         lineage.setExpression(alias.child().sql());
                     } catch (Exception e) {
@@ -389,10 +402,20 @@ public class LogicalPlanLineageParser {
 
                     // 提取别名字段的依赖
                     Set<String> depNames = extractDependencies(alias.child());
+                    if (DEBUG_MODE && !depNames.isEmpty()) {
+                        System.out.println("      Field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
+                    }
                     for (String depName : depNames) {
                         FieldLineage dep = findFieldInChildFields(depName, childFields);
                         if (dep != null) {
                             lineage.addDependency(cloneFieldLineage(dep));
+                            if (DEBUG_MODE) {
+                                System.out.println("        Added dependency: " + depName + " (total dependencies: " + lineage.getDependencies().size() + ")");
+                            }
+                        } else {
+                            if (DEBUG_MODE) {
+                                System.out.println("        WARNING: Cannot find dependency '" + depName + "' in childFields");
+                            }
                         }
                     }
 
@@ -478,15 +501,24 @@ public class LogicalPlanLineageParser {
                 }
 
                 Set<String> depNames = extractDependencies((Expression) expr);
+                if (DEBUG_MODE && !depNames.isEmpty()) {
+                    System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
+                }
                 for (String depName : depNames) {
                     FieldLineage dep = findFieldInChildFields(depName, childFields);
                     if (dep != null) {
                         lineage.addDependency(cloneFieldLineage(dep));
+                        if (DEBUG_MODE) {
+                            System.out.println("      Added dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
+                        }
                     } else {
                         System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for aggregate field " + fieldName);
                     }
                 }
 
+                if (DEBUG_MODE) {
+                    System.out.println("    Aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
+                }
                 result.put(fieldName, lineage);
             }
         }
