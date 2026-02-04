@@ -25,6 +25,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import static org.example.utils.AliasUtils.parseAliasDependencies;
+
 public class test {
 
     @AllArgsConstructor
@@ -128,7 +130,15 @@ public class test {
         if (plan instanceof Aggregate) {
             Aggregate aggregatePlan = (Aggregate) plan;
             Seq<NamedExpression> namedExpressionSeq = aggregatePlan.aggregateExpressions();
-            handleAggregateField(namedExpressionSeq);
+            Iterator<NamedExpression> iterator = namedExpressionSeq.iterator();
+            while (iterator.hasNext()) {
+                NamedExpression next = iterator.next();
+                if (next instanceof Alias) {
+                    Alias aliasPlan = (Alias) next;
+                    Set<String> strings = parseAliasDependencies(aliasPlan);
+                    System.out.println(strings);
+                }
+            }
             System.out.println(aggregatePlan);
         }
          return null;
@@ -358,34 +368,6 @@ public class test {
 //
 //        return fullLineage;
 //    }
-
-    /**
-     * 获取表达式类型（聚合/普通/条件等）
-     * @param expr 表达式
-     * @return 类型描述
-     */
-    private static Map<String, Set<String>> handleAggregateField(Seq<NamedExpression> namedExpressionSeq) {
-        Iterator<NamedExpression> iterator = namedExpressionSeq.iterator();
-        Map<String, Set<String>> map = new HashMap<>();
-        while (iterator.hasNext()) {
-            NamedExpression expr = iterator.next();
-            if (expr instanceof Alias) {
-                Alias alias = (Alias) expr;
-                String fieldAlias = alias.sql();
-                String[] split = fieldAlias.split("AS");
-                map.put(split[0].trim(), );
-                System.out.println(fieldAlias);
-            }
-            if (expr instanceof UnresolvedAttribute) {
-                UnresolvedAttribute alias = (UnresolvedAttribute) expr;
-                String fieldAlias = alias.name();
-                map.put(fieldAlias,fieldAlias);
-                System.out.println(fieldAlias);
-            }
-
-        }
-       return new HashMap<>();
-    }
 
     private static Map<String, String> handleColumn(Map<String, String> map, Blood blood) {
         List<String> sources = blood.getSources();
