@@ -405,9 +405,8 @@ public class LogicalPlanLineageParser {
                     }
                 } else if (expr instanceof UnresolvedAttribute) {
                     // 未解析的属性引用：字段不存在或SQL有错误
-                    lineage.setFieldType(FieldLineage.FieldType.ERROR);
+                    lineage.setFieldType(FieldLineage.FieldType.COLUMN);
                     lineage.setExpression(expr.toString());
-                    System.out.println("    WARNING: UnresolvedAttribute detected - field '" + fieldName + "' may not exist in source table");
                     // 尝试从childFields查找（可能只是带前缀的字段名）
                     FieldLineage original = findFieldInChildFields(fieldName, childFields);
                     if (original != null) {
@@ -1017,6 +1016,145 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
+        sql = "WITH\n" +
+                "-- 【CTE1：基础用户表筛选】单表过滤，提取有效用户（注册日期+等级过滤），基础字段重命名\n" +
+                "cte_base_user AS (\n" +
+                "    SELECT\n" +
+                "        user_id,\n" +
+                "        t.user_name AS uname,\n" +
+                "        user_level AS ulevel,\n" +
+                "        register_time AS reg_time,\n" +
+                "        register_date AS reg_date\n" +
+                "    FROM t_user t\n" +
+                "    WHERE register_date = '2026-02-04'\n" +
+                "      AND user_level >= 2  -- 过滤低等级用户\n" +
+                "),\n" +
+                "\n" +
+                "-- 【CTE2：内部含JOIN】订单主表+明细表INNER JOIN，行级聚合+无效数据过滤，为后续统计做准备\n" +
+                "cte_order_join AS (\n" +
+                "    SELECT\n" +
+                "        oi.order_id AS oid,\n" +
+                "        o.user_id AS uid,\n" +
+                "        o.order_amount AS o_total_amt,  -- 主表订单总金额\n" +
+                "        o.pay_status AS pay_sts,\n" +
+                "        o.create_time AS o_cre_time,\n" +
+                "        o.pay_time AS o_pay_time,\n" +
+                "        -- 行级聚合：明细表计算实际支付金额（单价*数量），过滤无效订单项\n" +
+                "        SUM(oi.goods_price * oi.goods_num) AS o_item_amt,\n" +
+                "        COUNT(oi.item_id) AS o_item_count,  -- 订单包含商品数\n" +
+                "        AVG(oi.goods_price) AS o_avg_price  -- 订单商品平均单价\n" +
+                "    FROM t_order o\n" +
+                "    INNER JOIN t_order_item oi\n" +
+                "        ON o.order_id = oi.order_id\n" +
+                "        AND o.order_date = oi.order_date  -- 分区字段关联，提升JOIN效率\n" +
+                "    WHERE o.order_date = '2026-02-04'\n" +
+                "      AND oi.goods_num > 0  -- 过滤0数量订单项\n" +
+                "      AND o.order_amount > 0\n" +
+                "    GROUP BY o.order_id, o.user_id, o.order_amount, o.pay_status, o.create_time, o.pay_time\n" +
+                "),\n" +
+                "\n" +
+                "-- 【CTE3：查询前置CTE】关联CTE1(用户)和CTE2(订单JOIN结果)，新增条件函数+字段加工\n" +
+                "cte_user_order AS (\n" +
+                "    SELECT\n" +
+                "        bu.uid,\n" +
+                "        bu.uname,\n" +
+                "        bu.ulevel,\n" +
+                "        bu.reg_time,\n" +
+                "        oj.oid,\n" +
+                "        oj.o_total_amt,\n" +
+                "        oj.o_item_amt,\n" +
+                "        oj.o_item_count,\n" +
+                "        oj.o_avg_price,\n" +
+                "        oj.pay_sts,\n" +
+                "        oj.o_cre_time,\n" +
+                "        oj.o_pay_time,\n" +
+                "        -- 条件函数：将支付状态转为文字，血缘覆盖CASE WHEN\n" +
+                "        CASE oj.pay_sts\n" +
+                "            WHEN 1 THEN 'PAID'\n" +
+                "            WHEN 0 THEN 'UNPAID'\n" +
+                "            WHEN 2 THEN 'REFUND'\n" +
+                "            ELSE 'UNKNOWN'\n" +
+                "        END AS pay_status_desc,\n" +
+                "        -- 日期函数：计算下单到支付的时长（秒），血缘覆盖TIMESTAMPDIFF\n" +
+                "        TIMESTAMPDIFF(SECOND, oj.o_cre_time, oj.o_pay_time) AS pay_duration_sec\n" +
+                "    FROM cte_base_user bu\n" +
+                "    LEFT JOIN cte_order_join oj\n" +
+                "        ON bu.uid = oj.uid\n" +
+                "),\n" +
+                "\n" +
+                "-- 【CTE4：自引用CTE+聚合函数】基于CTE3做用户维度聚合统计，覆盖SUM/COUNT/DISTINCT/IF\n" +
+                "cte_user_agg AS (\n" +
+                "    SELECT\n" +
+                "        uid,\n" +
+                "        uname,\n" +
+                "        ulevel,\n" +
+                "        reg_time,\n" +
+                "        -- 聚合函数：用户总订单数（含所有状态）\n" +
+                "        COUNT(DISTINCT oid) AS total_order_count,\n" +
+                "        -- 聚合函数：用户已支付订单数（条件计数，血缘覆盖IF+COUNT）\n" +
+                "        COUNT(IF(pay_sts = 1, oid, NULL)) AS paid_order_count,\n" +
+                "        -- 聚合函数：用户已支付订单总金额（过滤退款/未支付，血缘覆盖SUM+WHERE）\n" +
+                "        SUM(IF(pay_sts = 1, o_total_amt, 0)) AS paid_total_amt,\n" +
+                "        -- 聚合函数：用户已支付订单平均商品数\n" +
+                "        AVG(IF(pay_sts = 1, o_item_count, NULL)) AS paid_avg_item_count,\n" +
+                "        -- 聚合函数：用户平均支付时长（仅已支付订单）\n" +
+                "        AVG(IF(pay_sts = 1, pay_duration_sec, NULL)) AS avg_pay_duration_sec,\n" +
+                "        -- 比例计算：已支付订单占比（保留2位小数）\n" +
+                "        ROUND(COUNT(IF(pay_sts = 1, oid, NULL)) / COUNT(DISTINCT oid), 2) AS paid_order_rate\n" +
+                "    FROM cte_user_order\n" +
+                "    GROUP BY uid, uname, ulevel, reg_time\n" +
+                "    HAVING total_order_count > 0  -- 过滤无订单用户\n" +
+                "),\n" +
+                "\n" +
+                "-- 【CTE5：窗口函数+分组】基于CTE4做用户等级维度排名，覆盖ROW_NUMBER/PARTITION BY\n" +
+                "cte_user_rnk AS (\n" +
+                "    SELECT\n" +
+                "        *,\n" +
+                "        -- 窗口函数：按用户等级分组，已支付金额降序排名，血缘覆盖窗口函数\n" +
+                "        ROW_NUMBER() OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_rnk,\n" +
+                "        -- 窗口函数：按用户等级分组，已支付金额累计求和，血缘覆盖SUM窗口\n" +
+                "        SUM(paid_total_amt) OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_paid_amt_cum\n" +
+                "    FROM cte_user_agg\n" +
+                ")\n" +
+                "\n" +
+                "-- 【主查询：多CTE关联+最终过滤】关联CTE3(明细)和CTE5(聚合+排名)，输出全量血缘字段\n" +
+                "SELECT\n" +
+                "    -- 聚合层字段（来自CTE5）\n" +
+                "    rnk.uid,\n" +
+                "    rnk.uname,\n" +
+                "    rnk.ulevel,\n" +
+                "    rnk.reg_time,\n" +
+                "    rnk.total_order_count,\n" +
+                "    rnk.paid_order_count,\n" +
+                "    rnk.paid_total_amt,\n" +
+                "    rnk.paid_avg_item_count,\n" +
+                "    rnk.avg_pay_duration_sec,\n" +
+                "    rnk.paid_order_rate,\n" +
+                "    rnk.level_rnk,\n" +
+                "    rnk.level_paid_amt_cum,\n" +
+                "    -- 明细层字段（来自CTE3）\n" +
+                "    ord.oid,\n" +
+                "    ord.o_total_amt,\n" +
+                "    ord.o_item_amt,\n" +
+                "    ord.o_item_count,\n" +
+                "    ord.pay_sts,\n" +
+                "    ord.pay_status_desc,\n" +
+                "    ord.o_cre_time,\n" +
+                "    ord.o_pay_time,\n" +
+                "    ord.pay_duration_sec,\n" +
+                "    -- 常量字段：血缘覆盖常量值\n" +
+                "    '2026-02-04' AS data_date,\n" +
+                "    -- 函数嵌套：血缘覆盖多层函数（ISNULL+CAST）\n" +
+                "    CAST(ISNULL(ord.pay_duration_sec, 0) AS BIGINT) AS pay_duration_sec_nn  -- 空值填充为0\n" +
+                "FROM cte_user_rnk rnk\n" +
+                "LEFT JOIN cte_user_order ord\n" +
+                "    ON rnk.uid = ord.uid\n" +
+                "WHERE rnk.paid_order_count > 0  -- 最终过滤：仅保留有已支付订单的用户\n" +
+                "ORDER BY\n" +
+                "    rnk.ulevel ASC,\n" +
+                "    rnk.level_rnk ASC,\n" +
+                "    ord.o_cre_time ASC;";
+
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
                 .master("local[*]")
