@@ -1,5 +1,6 @@
 package org.example.utils;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.analysis.Analyzer;
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation;
@@ -312,27 +313,7 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
 
         // 调试：打印 Project 的字段列表
-        System.out.println("    DEBUG Project: childFields has " + childFields.size() + " fields");
         Seq<NamedExpression> projectList = plan.projectList();
-        if (projectList != null && !projectList.isEmpty()) {
-            System.out.println("    DEBUG Project: projectList has " + projectList.size() + " expressions");
-            // 打印每个表达式
-            Iterator<NamedExpression> it = projectList.iterator();
-            int idx = 0;
-            while (it.hasNext()) {
-                NamedExpression expr = it.next();
-                if (expr != null) {
-                    String exprName = "UNKNOWN";
-                    try {
-                        exprName = expr.name();
-                    } catch (Exception e) {
-                        exprName = expr.toString();
-                    }
-                    System.out.println("      [" + idx + "] " + exprName);
-                    idx++;
-                }
-            }
-        }
 
         Map<String, FieldLineage> result = new HashMap<>();
 
@@ -345,7 +326,13 @@ public class LogicalPlanLineageParser {
                 // 安全获取字段名
                 String fieldName;
                 try {
-                    fieldName = expr.name();
+                    //todo 这里需要再严谨判断
+                    if (expr instanceof AttributeReference) {
+                        fieldName= expr.qualifiedName();
+                    }
+                    else {
+                        fieldName = expr.name();
+                    }
                     if (fieldName == null) {
                         continue;
                     }
@@ -670,13 +657,45 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> rightFields = parseLogicalPlan(plan.right(), cteCache);
 
         Map<String, FieldLineage> result = new HashMap<>();
-        //todo 加上别名，防止左右的同名字段被覆盖
+
+        // 处理左表字段
         for (Map.Entry<String, FieldLineage> entry : leftFields.entrySet()) {
-            result.put(entry.getKey(), entry.getValue());
+            String fieldName = entry.getKey();
+            FieldLineage lineage = entry.getValue();
+
+            // 先直接 put 左表字段
+            result.put(fieldName, lineage);
         }
 
+        // 处理右表字段
         for (Map.Entry<String, FieldLineage> entry : rightFields.entrySet()) {
-            result.put(entry.getKey(), entry.getValue());
+            String fieldName = entry.getKey();
+            FieldLineage lineage = entry.getValue();
+
+            // 检查是否有同名字段
+            if (result.containsKey(fieldName)) {
+                // 存在同名，需要处理冲突
+                FieldLineage existing = result.remove(fieldName);
+
+                // 获取两个字段的 tableName
+                String leftTableName = existing.getTableName();
+                String rightTableName = lineage.getTableName();
+
+                // 如果 tableName 不为空，给左表字段加前缀
+                if (leftTableName != null && !leftTableName.isEmpty()) {
+                    String leftPrefixedKey = leftTableName + "." + fieldName;
+                    result.put(leftPrefixedKey, existing);
+                }
+
+                // 如果 tableName 不为空，给右表字段加前缀
+                if (rightTableName != null && !rightTableName.isEmpty()) {
+                    String rightPrefixedKey = rightTableName + "." + fieldName;
+                    result.put(rightPrefixedKey, lineage);
+                }
+            } else {
+                // 没有同名，直接 put
+                result.put(fieldName, lineage);
+            }
         }
 
         return result;
