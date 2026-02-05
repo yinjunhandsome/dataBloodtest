@@ -53,7 +53,8 @@ public class FieldLineage {
         ALIAS,           // 别名字段
         CONSTANT,        // 常量
         WINDOW_FUNCTION, // 窗口函数
-        LITERAL          // 字面量
+        LITERAL,         // 字面量
+        ERROR
     }
 
     public FieldLineage() {

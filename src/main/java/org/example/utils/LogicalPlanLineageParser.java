@@ -403,6 +403,23 @@ public class LogicalPlanLineageParser {
                     if (original != null) {
                         lineage.addDependency(cloneFieldLineage(original));
                     }
+                } else if (expr instanceof UnresolvedAttribute) {
+                    // 未解析的属性引用：字段不存在或SQL有错误
+                    lineage.setFieldType(FieldLineage.FieldType.ERROR);
+                    lineage.setExpression(expr.toString());
+                    System.out.println("    WARNING: UnresolvedAttribute detected - field '" + fieldName + "' may not exist in source table");
+                    // 尝试从childFields查找（可能只是带前缀的字段名）
+                    FieldLineage original = findFieldInChildFields(fieldName, childFields);
+                    if (original != null) {
+                        lineage.addDependency(cloneFieldLineage(original));
+                    } else {
+                        // 尝试用 UnresolvedAttribute 的 name() 方法获取的字段名
+                        String unresolvedName = ((UnresolvedAttribute) expr).name();
+                        original = findFieldInChildFields(unresolvedName, childFields);
+                        if (original != null) {
+                            lineage.addDependency(cloneFieldLineage(original));
+                        }
+                    }
                 } else {
                     // 计算字段 - 转换为Expression获取sql()
                     lineage.setFieldType(determineExpressionType((Expression) expr));
@@ -970,7 +987,7 @@ public class LogicalPlanLineageParser {
                 "        -- 计算单商品的小计金额\n" +
                 "        oi.goods_num * oi.goods_price AS goods_subtotal,\n" +
                 "        -- 【不存在字段】测试血缘：t_order表中无此字段\n" +
-                "        o.nonexistent_order_field \n" +
+                "        o.nonexistent_order_field\n" +
                 "    FROM t_user u\n" +
                 "    INNER JOIN t_order o \n" +
                 "        ON u.user_id = o.user_id\n" +
@@ -996,9 +1013,10 @@ public class LogicalPlanLineageParser {
                 "    ROW_NUMBER() OVER (\n" +
                 "        PARTITION BY user_id \n" +
                 "        ORDER BY order_create_time DESC\n" +
-                "    ) AS user_order_rn\n" +
+                "    ) AS user_order_rn,\n" +
+                "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
-                "ORDER BY user_id, user_order_rn;";
+                "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
                 .master("local[*]")
