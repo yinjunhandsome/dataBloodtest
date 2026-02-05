@@ -16,8 +16,6 @@ import scala.collection.Iterator;
 import scala.collection.Seq;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 /**
  * Spark LogicalPlan 字段级血缘解析器
@@ -38,8 +36,6 @@ public class LogicalPlanLineageParser {
     // 设为false关闭所有调试输出，设为true开启详细日志
     private static final boolean DEBUG_MODE = false;
 
-    // CTE缓存，避免循环递归
-    private static final Map<String, Map<String, FieldLineage>> CTE_CACHE = new ConcurrentHashMap<>();
 
     /**
      * 解析入口：解析LogicalPlan生成字段级血缘
@@ -51,7 +47,6 @@ public class LogicalPlanLineageParser {
         if (plan == null) {
             return new HashMap<>();
         }
-        CTE_CACHE.clear();
         return parseLogicalPlan(plan, new HashMap<>());
     }
 
@@ -61,12 +56,6 @@ public class LogicalPlanLineageParser {
     private static Map<String, FieldLineage> parseLogicalPlan(LogicalPlan plan, Map<String, Map<String, FieldLineage>> cteCache) {
         if (plan == null) {
             return new HashMap<>();
-        }
-
-        // 调试：打印节点类型（不调用 output() 避免未解析节点报错）
-        System.out.println(">>> Parsing node: " + plan.getClass().getSimpleName());
-        if (plan instanceof Window) {
-            System.out.println("    This is a Window node!");
         }
 
         try {
@@ -303,6 +292,7 @@ public class LogicalPlanLineageParser {
                     String fieldName = attr.name();
                     FieldLineage lineage = new FieldLineage(fieldName, fullTableName);
                     lineage.setFieldType(FieldLineage.FieldType.COLUMN);
+                    lineage.setSourceTableName(fullTableName);
                     result.put(fieldName, lineage);
                 }
             }
@@ -466,7 +456,6 @@ public class LogicalPlanLineageParser {
                 if (expr instanceof NamedExpression) {
                     String fieldName = ((NamedExpression) expr).name();
                     FieldLineage lineage = new FieldLineage(fieldName, "AGGREGATE");
-
                     Set<String> depNames = extractDependencies(expr);
                     for (String depName : depNames) {
                         FieldLineage dep = findFieldInChildFields(depName, childFields);
@@ -681,11 +670,7 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> rightFields = parseLogicalPlan(plan.right(), cteCache);
 
         Map<String, FieldLineage> result = new HashMap<>();
-
-        // 合并左右表字段（添加表名前缀避免冲突）
-        String leftPrefix = getTableName(leftFields);
-        String rightPrefix = getTableName(rightFields);
-
+        //todo 加上别名，防止左右的同名字段被覆盖
         for (Map.Entry<String, FieldLineage> entry : leftFields.entrySet()) {
             result.put(entry.getKey(), entry.getValue());
         }
@@ -788,7 +773,7 @@ public class LogicalPlanLineageParser {
             return field;
         }
 
-        // 提取短字段名（去掉前缀）
+        //todo 如果左右加了短名称作为区别的话，需要去掉再次判断 提取短字段名（去掉前缀）
         String shortName = null;
         if (fieldName.contains(".")) {
             shortName = fieldName.substring(fieldName.lastIndexOf('.') + 1);
@@ -854,6 +839,8 @@ public class LogicalPlanLineageParser {
         cloned.setTableName(original.getTableName());
         cloned.setFieldType(original.getFieldType());
         cloned.setExpression(original.getExpression());
+        cloned.setSourceTableName(original.getSourceTableName());
+
 
         for (FieldLineage dep : original.getDependencies()) {
             cloned.addDependency(cloneFieldLineage(dep));
@@ -949,144 +936,50 @@ public class LogicalPlanLineageParser {
 //        System.setProperty("hive.metastore.cache.expireAfter", "0s");
 
         // 构建SparkSession：本地解析血缘专属配置
-        String sql = "WITH\n" +
-                "-- 【CTE1：基础用户表筛选】单表过滤，提取有效用户（注册日期+等级过滤），基础字段重命名\n" +
-                "cte_base_user AS (\n" +
+        String sql = "WITH user_order_detail AS (\n" +
+                "    -- 关联用户表、订单表、订单明细表，整合基础信息\n" +
                 "    SELECT\n" +
-                "        user_id,\n" +
-                "        t.user_name AS uname,\n" +
-                "        user_level AS ulevel,\n" +
-                "        register_time AS reg_time,\n" +
-                "        register_date AS reg_date\n" +
-                "    FROM t_user t\n" +
-                "    WHERE register_date = '2026-02-04'\n" +
-                "      AND user_level >= 2  -- 过滤低等级用户\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE2：内部含JOIN】订单主表+明细表INNER JOIN，行级聚合+无效数据过滤，为后续统计做准备\n" +
-                "cte_order_join AS (\n" +
-                "    SELECT\n" +
-                "        oi.order_id AS oid,\n" +
-                "        o.user_id AS uid,\n" +
-                "        o.order_amount AS o_total_amt,  -- 主表订单总金额\n" +
-                "        o.pay_status AS pay_sts,\n" +
-                "        o.create_time AS o_cre_time,\n" +
-                "        o.pay_time AS o_pay_time,\n" +
-                "        -- 行级聚合：明细表计算实际支付金额（单价*数量），过滤无效订单项\n" +
-                "        SUM(oi.goods_price * oi.goods_num) AS o_item_amt,\n" +
-                "        COUNT(oi.item_id) AS o_item_count,  -- 订单包含商品数\n" +
-                "        AVG(oi.goods_price) AS o_avg_price  -- 订单商品平均单价\n" +
-                "    FROM t_order o\n" +
-                "    INNER JOIN t_order_item oi\n" +
+                "        u.user_id,\n" +
+                "        u.user_name,\n" +
+                "        o.order_id,\n" +
+                "        o.order_amount,\n" +
+                "        o.create_time AS order_create_time,\n" +
+                "        oi.item_id,\n" +
+                "        oi.goods_id,\n" +
+                "        oi.goods_num,\n" +
+                "        oi.goods_price,\n" +
+                "        -- 计算单商品的小计金额\n" +
+                "        oi.goods_num * oi.goods_price AS goods_subtotal,\n" +
+                "        -- 【不存在字段】测试血缘：t_order表中无此字段\n" +
+                "        o.nonexistent_order_field \n" +
+                "    FROM t_user u\n" +
+                "    INNER JOIN t_order o \n" +
+                "        ON u.user_id = o.user_id\n" +
+                "    INNER JOIN t_order_item oi \n" +
                 "        ON o.order_id = oi.order_id\n" +
-                "        AND o.order_date = oi.order_date  -- 分区字段关联，提升JOIN效率\n" +
-                "    WHERE o.order_date = '2026-02-04'\n" +
-                "      AND oi.goods_num > 0  -- 过滤0数量订单项\n" +
-                "      AND o.order_amount > 0\n" +
-                "    GROUP BY o.order_id, o.user_id, o.order_amount, o.pay_status, o.create_time, o.pay_time\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE3：查询前置CTE】关联CTE1(用户)和CTE2(订单JOIN结果)，新增条件函数+字段加工\n" +
-                "cte_user_order AS (\n" +
-                "    SELECT\n" +
-                "        bu.uid,\n" +
-                "        bu.uname,\n" +
-                "        bu.ulevel,\n" +
-                "        bu.reg_time,\n" +
-                "        oj.oid,\n" +
-                "        oj.o_total_amt,\n" +
-                "        oj.o_item_amt,\n" +
-                "        oj.o_item_count,\n" +
-                "        oj.o_avg_price,\n" +
-                "        oj.pay_sts,\n" +
-                "        oj.o_cre_time,\n" +
-                "        oj.o_pay_time,\n" +
-                "        -- 条件函数：将支付状态转为文字，血缘覆盖CASE WHEN\n" +
-                "        CASE oj.pay_sts\n" +
-                "            WHEN 1 THEN 'PAID'\n" +
-                "            WHEN 0 THEN 'UNPAID'\n" +
-                "            WHEN 2 THEN 'REFUND'\n" +
-                "            ELSE 'UNKNOWN'\n" +
-                "        END AS pay_status_desc,\n" +
-                "        -- 日期函数：计算下单到支付的时长（秒），血缘覆盖TIMESTAMPDIFF\n" +
-                "        TIMESTAMPDIFF(SECOND, oj.o_cre_time, oj.o_pay_time) AS pay_duration_sec\n" +
-                "    FROM cte_base_user bu\n" +
-                "    LEFT JOIN cte_order_join oj\n" +
-                "        ON bu.uid = oj.uid\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE4：自引用CTE+聚合函数】基于CTE3做用户维度聚合统计，覆盖SUM/COUNT/DISTINCT/IF\n" +
-                "cte_user_agg AS (\n" +
-                "    SELECT\n" +
-                "        uid,\n" +
-                "        uname,\n" +
-                "        ulevel,\n" +
-                "        reg_time,\n" +
-                "        -- 聚合函数：用户总订单数（含所有状态）\n" +
-                "        COUNT(DISTINCT oid) AS total_order_count,\n" +
-                "        -- 聚合函数：用户已支付订单数（条件计数，血缘覆盖IF+COUNT）\n" +
-                "        COUNT(IF(pay_sts = 1, oid, NULL)) AS paid_order_count,\n" +
-                "        -- 聚合函数：用户已支付订单总金额（过滤退款/未支付，血缘覆盖SUM+WHERE）\n" +
-                "        SUM(IF(pay_sts = 1, o_total_amt, 0)) AS paid_total_amt,\n" +
-                "        -- 聚合函数：用户已支付订单平均商品数\n" +
-                "        AVG(IF(pay_sts = 1, o_item_count, NULL)) AS paid_avg_item_count,\n" +
-                "        -- 聚合函数：用户平均支付时长（仅已支付订单）\n" +
-                "        AVG(IF(pay_sts = 1, pay_duration_sec, NULL)) AS avg_pay_duration_sec,\n" +
-                "        -- 比例计算：已支付订单占比（保留2位小数）\n" +
-                "        ROUND(COUNT(IF(pay_sts = 1, oid, NULL)) / COUNT(DISTINCT oid), 2) AS paid_order_rate\n" +
-                "    FROM cte_user_order\n" +
-                "    GROUP BY uid, uname, ulevel, reg_time\n" +
-                "    HAVING total_order_count > 0  -- 过滤无订单用户\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE5：窗口函数+分组】基于CTE4做用户等级维度排名，覆盖ROW_NUMBER/PARTITION BY\n" +
-                "cte_user_rnk AS (\n" +
-                "    SELECT\n" +
-                "        *,\n" +
-                "        -- 窗口函数：按用户等级分组，已支付金额降序排名，血缘覆盖窗口函数\n" +
-                "        ROW_NUMBER() OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_rnk,\n" +
-                "        -- 窗口函数：按用户等级分组，已支付金额累计求和，血缘覆盖SUM窗口\n" +
-                "        SUM(paid_total_amt) OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_paid_amt_cum\n" +
-                "    FROM cte_user_agg\n" +
+                "    WHERE o.order_date >= '2026-01-01' -- 筛选2026年的订单\n" +
                 ")\n" +
-                "\n" +
-                "-- 【主查询：多CTE关联+最终过滤】关联CTE3(明细)和CTE5(聚合+排名)，输出全量血缘字段\n" +
+                "-- 主查询：计算用户维度的统计指标\n" +
                 "SELECT\n" +
-                "    -- 聚合层字段（来自CTE5）\n" +
-                "    rnk.uid,\n" +
-                "    rnk.uname,\n" +
-                "    rnk.ulevel,\n" +
-                "    rnk.reg_time,\n" +
-                "    rnk.total_order_count,\n" +
-                "    rnk.paid_order_count,\n" +
-                "    rnk.paid_total_amt,\n" +
-                "    rnk.paid_avg_item_count,\n" +
-                "    rnk.avg_pay_duration_sec,\n" +
-                "    rnk.paid_order_rate,\n" +
-                "    rnk.level_rnk,\n" +
-                "    rnk.level_paid_amt_cum,\n" +
-                "    -- 明细层字段（来自CTE3）\n" +
-                "    ord.oid,\n" +
-                "    ord.o_total_amt,\n" +
-                "    ord.o_item_amt,\n" +
-                "    ord.o_item_count,\n" +
-                "    ord.pay_sts,\n" +
-                "    ord.pay_status_desc,\n" +
-                "    ord.o_cre_time,\n" +
-                "    ord.o_pay_time,\n" +
-                "    ord.pay_duration_sec,\n" +
-                "    -- 常量字段：血缘覆盖常量值\n" +
-                "    '2026-02-04' AS data_date,\n" +
-                "    -- 函数嵌套：血缘覆盖多层函数（ISNULL+CAST）\n" +
-                "    CAST(ISNULL(ord.pay_duration_sec, 0) AS BIGINT) AS pay_duration_sec_nn  -- 空值填充为0\n" +
-                "FROM cte_user_rnk rnk\n" +
-                "LEFT JOIN cte_user_order ord\n" +
-                "    ON rnk.uid = ord.uid\n" +
-                "WHERE rnk.paid_order_count > 0  -- 最终过滤：仅保留有已支付订单的用户\n" +
-                "ORDER BY\n" +
-                "    rnk.ulevel ASC,\n" +
-                "    rnk.level_rnk ASC,\n" +
-                "    ord.o_cre_time ASC;";
+                "    user_id,\n" +
+                "    user_name,\n" +
+                "    order_id,\n" +
+                "    order_create_time,\n" +
+                "    goods_id,\n" +
+                "    goods_num,\n" +
+                "    goods_price,\n" +
+                "    goods_subtotal,\n" +
+                "    -- 计算单订单的商品总金额（同订单下所有商品小计之和）\n" +
+                "    SUM(goods_subtotal) OVER (PARTITION BY order_id) AS order_goods_total,\n" +
+                "    -- 计算用户的累计消费金额（用户所有订单的商品总金额之和）\n" +
+                "    SUM(goods_subtotal) OVER (PARTITION BY user_id) AS user_total_consume,\n" +
+                "    -- 计算用户的订单数排名（按下单时间倒序）\n" +
+                "    ROW_NUMBER() OVER (\n" +
+                "        PARTITION BY user_id \n" +
+                "        ORDER BY order_create_time DESC\n" +
+                "    ) AS user_order_rn\n" +
+                "FROM user_order_detail\n" +
+                "ORDER BY user_id, user_order_rn;";
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
                 .master("local[*]")
@@ -1119,30 +1012,29 @@ public class LogicalPlanLineageParser {
 
             // 3. 验证解析结果：检查是否还有未解析的表/字段
             boolean hasUnresolved = resolvedPlan.exists(p -> p instanceof UnresolvedRelation);
-            System.out.println("===== 2. 解析结果验证 =====");
-            System.out.println("是否存在未解析的表/字段：" + (hasUnresolved ? "是（需检查元数据/配置）" : "否（解析成功）") + "\n");
-
-            // 4. 输出已解析的逻辑计划（用于血缘解析）
-            System.out.println("===== 3. 已解析逻辑计划（ResolvedPlan） =====");
-            System.out.println(resolvedPlan.simpleString(1000000) + "\n");
+//            System.out.println("===== 2. 解析结果验证 =====");
+//            System.out.println("是否存在未解析的表/字段：" + (hasUnresolved ? "是（需检查元数据/配置）" : "否（解析成功）") + "\n");
+//
+//            // 4. 输出已解析的逻辑计划（用于血缘解析）
+//            System.out.println("===== 3. 已解析逻辑计划（ResolvedPlan） =====");
+//            System.out.println(resolvedPlan.simpleString(1000000) + "\n");
 
             // 5. 调用你的血缘解析方法：传入已解析的逻辑计划
             Map<String, FieldLineage> parse = parse(resolvedPlan);
             System.out.println("===== 4. 血缘解析结果 =====");
-            System.out.println(parse);
+            Map<String, Set<String>> outputToSourceMapping = new HashMap<>();
 
-            // 打印详细血缘链（选择几个示例字段）
-            System.out.println("\n===== 5. 详细血缘链示例 =====");
-            String[] sampleFields = {"rnk.uid", "rnk.paid_total_amt", "rnk.level_rnk"};
-            for (String fieldName : sampleFields) {
-                FieldLineage lineage = parse.get(fieldName);
-                if (lineage != null) {
-                    System.out.println("\n字段: " + fieldName);
-                    System.out.println(lineage.getLineageDescription());
-                    System.out.println("所有源头字段: " + lineage.getAllSourceFields());
-                }
+            for (Map.Entry<String, FieldLineage> entry : parse.entrySet()) {
+                String outputField = entry.getKey();
+                Set<String> sourceFields = entry.getValue().getAllSourceFields();
+                outputToSourceMapping.put(outputField, sourceFields);
             }
-            System.out.println("\n===== 血缘链示例结束 =====");
+
+            // 3. 打印映射
+            System.out.println("========== 字段映射关系 ==========");
+            for (Map.Entry<String, Set<String>> entry : outputToSourceMapping.entrySet()) {
+                System.out.println(entry.getKey() + " → " + entry.getValue());
+            }
             // 此处可添加血缘结果的打印/解析逻辑（如递归输出字段依赖）
 
         } catch (ParseException e) {

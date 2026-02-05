@@ -1,5 +1,8 @@
 package org.example.utils;
 
+import lombok.*;
+import org.apache.commons.lang3.StringUtils;
+
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -7,16 +10,26 @@ import java.util.stream.Collectors;
  * 字段级血缘实体类
  * 表示单个字段的完整血缘链路
  */
+@Data
+@AllArgsConstructor
+@Setter
+@Getter
 public class FieldLineage {
     /**
      * 字段名称
      */
     private String fieldName;
 
+
     /**
      * 所属表/节点名称
      */
     private String tableName;
+
+    /**
+     * 原始库表名称
+     */
+    private String sourceTableName;
 
     /**
      * 字段类型（列、计算字段、聚合字段等）
@@ -104,7 +117,7 @@ public class FieldLineage {
      * 获取完整字段路径
      */
     public String getFullName() {
-        return tableName != null ? tableName + "." + fieldName : fieldName;
+        return sourceTableName != null ? sourceTableName + "." + fieldName :"";
     }
 
     /**
