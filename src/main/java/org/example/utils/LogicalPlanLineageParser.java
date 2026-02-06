@@ -1,16 +1,19 @@
 package org.example.utils;
 
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang.StringUtils;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.catalyst.analysis.Analyzer;
-import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation;
-import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute;
+import org.apache.spark.sql.catalyst.analysis.*;
 import org.apache.spark.sql.catalyst.catalog.CatalogTable;
 import org.apache.spark.sql.catalyst.expressions.*;
 import org.apache.spark.sql.catalyst.expressions.aggregate.*;
 import org.apache.spark.sql.catalyst.parser.ParseException;
 import org.apache.spark.sql.catalyst.plans.logical.*;
+import org.apache.spark.sql.execution.datasources.InsertIntoHadoopFsRelationCommand;
 import org.apache.spark.sql.execution.datasources.LogicalRelation;
+import org.apache.spark.sql.execution.datasources.SaveIntoDataSourceCommand;
+import org.apache.spark.sql.execution.command.*;
+import org.apache.spark.sql.hive.execution.CreateHiveTableAsSelectCommand;
+import org.apache.spark.sql.hive.execution.InsertIntoHiveTable;
 import scala.Option;
 import scala.Tuple2;
 import scala.collection.Iterator;
@@ -31,6 +34,10 @@ import java.util.*;
  * @author Claude Code
  * @version 1.0
  */
+
+//血缘
+//1.查询，查询字段->来源表字段
+//2.插入，插入字段(来源于真实表)->来源字段(常量插入为空)
 public class LogicalPlanLineageParser {
 
     // ==================== 调试开关 ====================
@@ -145,6 +152,65 @@ public class LogicalPlanLineageParser {
             }
             if (plan instanceof OneRowRelation) {
                 return parseOneRowRelation();
+            }
+
+            // ==================== 建表和写入算子 ====================
+            if (plan instanceof CreateHiveTableAsSelectCommand) {
+                return parseCreateHiveTableAsSelectCommand((CreateHiveTableAsSelectCommand) plan, cteCache);
+            }
+            if (plan instanceof InsertIntoHiveTable) {
+                return parseInsertIntoHiveTable((InsertIntoHiveTable) plan, cteCache);
+            }
+            if (plan instanceof InsertIntoHadoopFsRelationCommand) {
+                return parseInsertIntoHadoopFsRelationCommand((InsertIntoHadoopFsRelationCommand) plan, cteCache);
+            }
+            if (plan instanceof SaveIntoDataSourceCommand) {
+                return parseSaveIntoDataSourceCommand((SaveIntoDataSourceCommand) plan, cteCache);
+            }
+            if (plan instanceof CreateDataSourceTableCommand) {
+                return parseCreateDataSourceTableCommand((CreateDataSourceTableCommand) plan, cteCache);
+            }
+            if (plan instanceof CreateTableCommand) {
+                return parseCreateTableCommand((CreateTableCommand) plan, cteCache);
+            }
+            if (plan instanceof DropTableCommand) {
+                return parseDropTableCommand((DropTableCommand) plan);
+            }
+            if (plan instanceof AlterTableAddPartitionCommand) {
+                return parseAlterTableAddPartitionCommand((AlterTableAddPartitionCommand) plan);
+            }
+            if (plan instanceof AlterTableDropPartitionCommand) {
+                return parseAlterTableDropPartitionCommand((AlterTableDropPartitionCommand) plan);
+            }
+            // CacheTableCommand 和 UncacheTableCommand 在Spark 3.3.4中可能不存在，跳过
+            if (plan instanceof RefreshTableCommand) {
+                return parseRefreshTableCommand((RefreshTableCommand) plan);
+            }
+            if (plan instanceof ShowTablesCommand) {
+                return parseShowTablesCommand();
+            }
+            if (plan instanceof ShowColumnsCommand) {
+                return parseShowColumnsCommand((ShowColumnsCommand) plan);
+            }
+            if (plan instanceof ShowPartitionsCommand) {
+                return parseShowPartitionsCommand((ShowPartitionsCommand) plan);
+            }
+            if (plan instanceof DescribeTableCommand) {
+                return parseDescribeTableCommand((DescribeTableCommand) plan);
+            }
+            if (plan instanceof AnalyzeTableCommand) {
+                return parseAnalyzeTableCommand((AnalyzeTableCommand) plan);
+            }
+
+            // V2 Write操作
+            if (plan instanceof AppendData) {
+                return parseAppendData((AppendData) plan, cteCache);
+            }
+            if (plan instanceof OverwriteByExpression) {
+                return parseOverwriteByExpression((OverwriteByExpression) plan, cteCache);
+            }
+            if (plan instanceof OverwritePartitionsDynamic) {
+                return parseOverwritePartitionsDynamic((OverwritePartitionsDynamic) plan, cteCache);
             }
 
             // 未知算子：穿透
@@ -328,7 +394,7 @@ public class LogicalPlanLineageParser {
                 try {
                     //todo 这里需要再严谨判断
                     if (expr instanceof AttributeReference) {
-                        fieldName= expr.qualifiedName();
+                        fieldName=handleProjectExprName(expr.qualifiedName());
                     }
                     else {
                         fieldName = expr.name();
@@ -757,6 +823,337 @@ public class LogicalPlanLineageParser {
         return new HashMap<>();
     }
 
+    private static Map<String, FieldLineage> parseInsertIntoHadoopFsRelationCommand(InsertIntoHadoopFsRelationCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: InsertIntoHadoopFsRelationCommand =====");
+        System.out.println("Output path: " + plan.outputPath());
+        System.out.println("File format: " + plan.fileFormat());
+
+        // 获取写入逻辑计划，解析其血缘
+        LogicalPlan query = plan.query();
+        Map<String, FieldLineage> result = parseLogicalPlan(query, cteCache);
+
+        // 使用输出路径作为表名标识
+        Option<CatalogTable> catalogTableOption = plan.catalogTable();
+        String fullName="";
+        if (catalogTableOption.isDefined()) {
+            fullName=catalogTableOption.get().qualifiedName();
+        }
+        // 更新所有字段的表名为目标表
+        Map<String, FieldLineage> finalResult = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : result.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            lineage.setTableName(fullName);
+            finalResult.put(fullName+"."+entry.getKey(), lineage);
+        }
+        return finalResult;
+    }
+
+
+    /**
+     * 解析 CreateHiveTableAsSelectCommand
+     * CREATE TABLE hive_table AS SELECT ...
+     */
+    private static Map<String, FieldLineage> parseCreateHiveTableAsSelectCommand(CreateHiveTableAsSelectCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: CreateHiveTableAsSelectCommand =====");
+
+        // 获取目标表信息
+        String tableName = plan.tableDesc().identifier().table();
+        String dbName = plan.tableDesc().identifier().database().getOrElse(()->"default");
+        String fullName = dbName + "." + tableName;
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名为目标表
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            String[] split = entry.getKey().split("\\.");
+            String fieldName = split[split.length-1];
+            FieldLineage dependency = cloneFieldLineage(entry.getValue());
+            FieldLineage lineage =new FieldLineage();
+            lineage.setTableName(fullName);
+            lineage.setFieldName(fullName+"."+fieldName);
+            lineage.setDependencies(Collections.singletonList(dependency));
+            lineage.setTableName(tableName);
+            result.put(fullName+"."+fieldName, lineage);
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析 InsertIntoHiveTable
+     * INSERT INTO TABLE hive_table SELECT ...
+     * INSERT OVERWRITE TABLE hive_table SELECT ...
+     */
+    private static Map<String, FieldLineage> parseInsertIntoHiveTable(InsertIntoHiveTable plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: InsertIntoHiveTable =====");
+
+        // 获取目标表信息
+        String tableName = plan.table().identifier().table();
+        String dbName = plan.table().identifier().database().getOrElse(()->"default");
+        String fullName = dbName + "." + tableName;
+        boolean overwrite = plan.overwrite();
+        System.out.println("Target table: " + tableName);
+        System.out.println("Overwrite: " + overwrite);
+
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名为目标表
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            result.put(fullName+"."+entry.getKey(), lineage);
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析 SaveIntoDataSourceCommand
+     * df.save() / df.write.save() 产生的命令
+     */
+    private static Map<String, FieldLineage> parseSaveIntoDataSourceCommand(SaveIntoDataSourceCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: SaveIntoDataSourceCommand =====");
+        String tableName = plan.toString();
+        System.out.println("DataSource operation: " + tableName);
+
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            lineage.setTableName(tableName);
+            result.put(entry.getKey(), lineage);
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析 CreateDataSourceTableCommand
+     * CREATE TABLE table_name (schema) USING format
+     */
+    private static Map<String, FieldLineage> parseCreateDataSourceTableCommand(CreateDataSourceTableCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: CreateDataSourceTableCommand =====");
+        String tableName = plan.table().toString();
+        System.out.println("Created table: " + tableName);
+        // 创建空表，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 CreateTableCommand
+     * CREATE TABLE table_name (schema)
+     */
+    private static Map<String, FieldLineage> parseCreateTableCommand(CreateTableCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: CreateTableCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Created table: " + tableName);
+        // 创建空表，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 DropTableCommand
+     * DROP TABLE table_name
+     */
+    private static Map<String, FieldLineage> parseDropTableCommand(DropTableCommand plan) {
+        System.out.println("===== DEBUG: DropTableCommand =====");
+        String tableName = plan.tableName().toString();
+        System.out.println("Dropped table: " + tableName);
+        // 删除表操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 AlterTableAddPartitionCommand
+     * ALTER TABLE table_name ADD PARTITION (partition_spec)
+     */
+    private static Map<String, FieldLineage> parseAlterTableAddPartitionCommand(AlterTableAddPartitionCommand plan) {
+        System.out.println("===== DEBUG: AlterTableAddPartitionCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Added partition to table: " + tableName);
+        // 添加分区操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 AlterTableDropPartitionCommand
+     * ALTER TABLE table_name DROP PARTITION (partition_spec)
+     */
+    private static Map<String, FieldLineage> parseAlterTableDropPartitionCommand(AlterTableDropPartitionCommand plan) {
+        System.out.println("===== DEBUG: AlterTableDropPartitionCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Dropped partition from table: " + tableName);
+        // 删除分区操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 CacheTableCommand
+     * CACHE TABLE table_name SELECT ...
+     * 注意：此命令在Spark 3.3.4中可能不存在
+     */
+    // private static Map<String, FieldLineage> parseCacheTableCommand(CacheTableCommand plan) {
+    //     System.out.println("===== DEBUG: CacheTableCommand =====");
+    //     return new HashMap<>();
+    // }
+
+    /**
+     * 解析 UncacheTableCommand
+     * UNCACHE TABLE table_name
+     * 注意：此命令在Spark 3.3.4中可能不存在
+     */
+    // private static Map<String, FieldLineage> parseUncacheTableCommand(UncacheTableCommand plan) {
+    //     System.out.println("===== DEBUG: UncacheTableCommand =====");
+    //     return new HashMap<>();
+    // }
+
+    /**
+     * 解析 RefreshTableCommand
+     * REFRESH TABLE table_name
+     */
+    private static Map<String, FieldLineage> parseRefreshTableCommand(RefreshTableCommand plan) {
+        System.out.println("===== DEBUG: RefreshTableCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Refreshed table: " + tableName);
+        // 刷新表操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 ShowTablesCommand
+     * SHOW TABLES
+     */
+    private static Map<String, FieldLineage> parseShowTablesCommand() {
+        System.out.println("===== DEBUG: ShowTablesCommand =====");
+        System.out.println("Showed all tables");
+        // 查询操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 ShowColumnsCommand
+     * SHOW COLUMNS FROM table_name
+     */
+    private static Map<String, FieldLineage> parseShowColumnsCommand(ShowColumnsCommand plan) {
+        System.out.println("===== DEBUG: ShowColumnsCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Showed columns from table: " + tableName);
+        // 查询操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 ShowPartitionsCommand
+     * SHOW PARTITIONS table_name
+     */
+    private static Map<String, FieldLineage> parseShowPartitionsCommand(ShowPartitionsCommand plan) {
+        System.out.println("===== DEBUG: ShowPartitionsCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Showed partitions from table: " + tableName);
+        // 查询操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 DescribeTableCommand
+     * DESCRIBE TABLE table_name
+     */
+    private static Map<String, FieldLineage> parseDescribeTableCommand(DescribeTableCommand plan) {
+        System.out.println("===== DEBUG: DescribeTableCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Described table: " + tableName);
+        // 查询操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 AnalyzeTableCommand
+     * ANALYZE TABLE table_name COMPUTE STATISTICS
+     */
+    private static Map<String, FieldLineage> parseAnalyzeTableCommand(AnalyzeTableCommand plan) {
+        System.out.println("===== DEBUG: AnalyzeTableCommand =====");
+        String tableName = plan.toString();
+        System.out.println("Analyzed table: " + tableName);
+        // 分析操作，无血缘数据
+        return new HashMap<>();
+    }
+
+    // ==================== V2 Write操作 ====================
+
+    /**
+     * 解析 AppendData
+     * DataFrameWriterV2 append 操作
+     */
+    private static Map<String, FieldLineage> parseAppendData(AppendData plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: AppendData =====");
+        String tableName = plan.table().name();
+        System.out.println("Append to table: " + tableName);
+
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名为目标表
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            lineage.setTableName(tableName);
+            result.put(entry.getKey(), lineage);
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析 OverwriteByExpression
+     * DataFrameWriterV2 overwrite(where) 操作
+     */
+    private static Map<String, FieldLineage> parseOverwriteByExpression(OverwriteByExpression plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: OverwriteByExpression =====");
+        String tableName = plan.table().name();
+        System.out.println("Overwrite table: " + tableName);
+
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名为目标表
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            lineage.setTableName(tableName);
+            result.put(entry.getKey(), lineage);
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析 OverwritePartitionsDynamic
+     * 动态分区覆盖操作
+     */
+    private static Map<String, FieldLineage> parseOverwritePartitionsDynamic(OverwritePartitionsDynamic plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        System.out.println("===== DEBUG: OverwritePartitionsDynamic =====");
+        String tableName = plan.table().name();
+        System.out.println("Dynamic overwrite table: " + tableName);
+
+        // 解析查询部分的血缘
+        Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
+
+        // 更新表名为目标表
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+            FieldLineage lineage = cloneFieldLineage(entry.getValue());
+            lineage.setTableName(tableName);
+            result.put(entry.getKey(), lineage);
+        }
+
+        return result;
+    }
+
     // ==================== 辅助方法 ====================
 
     /**
@@ -812,13 +1209,15 @@ public class LogicalPlanLineageParser {
         String shortName = null;
         if (fieldName.contains(".")) {
             shortName = fieldName.substring(fieldName.lastIndexOf('.') + 1);
-            // 2. 尝试用短字段名匹配
-            field = childFields.get(shortName);
-            if (field != null) {
-                return field;
-            }
         }
-
+        else {
+            shortName= fieldName;
+        }
+        // 2. 尝试用短字段名匹配
+        field = childFields.get(shortName);
+        if (field != null) {
+            return field;
+        }
         // 3. 遍历所有字段，尝试匹配字段名部分
         for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
             String childFieldName = entry.getKey();
@@ -842,6 +1241,20 @@ public class LogicalPlanLineageParser {
         }
 
         return null;
+    }
+
+    private static String handleProjectExprName(String name){
+        if (StringUtils.isBlank(name)) {
+            return name;
+        }
+        String[] split = name.split("\\.");
+        if (split.length==1){
+            return split[0];
+        }
+        else {
+            return split[split.length-2]+"."+split[split.length-1];
+        }
+
     }
 
     /**
@@ -1016,144 +1429,7 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "WITH\n" +
-                "-- 【CTE1：基础用户表筛选】单表过滤，提取有效用户（注册日期+等级过滤），基础字段重命名\n" +
-                "cte_base_user AS (\n" +
-                "    SELECT\n" +
-                "        user_id,\n" +
-                "        t.user_name AS uname,\n" +
-                "        user_level AS ulevel,\n" +
-                "        register_time AS reg_time,\n" +
-                "        register_date AS reg_date\n" +
-                "    FROM t_user t\n" +
-                "    WHERE register_date = '2026-02-04'\n" +
-                "      AND user_level >= 2  -- 过滤低等级用户\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE2：内部含JOIN】订单主表+明细表INNER JOIN，行级聚合+无效数据过滤，为后续统计做准备\n" +
-                "cte_order_join AS (\n" +
-                "    SELECT\n" +
-                "        oi.order_id AS oid,\n" +
-                "        o.user_id AS uid,\n" +
-                "        o.order_amount AS o_total_amt,  -- 主表订单总金额\n" +
-                "        o.pay_status AS pay_sts,\n" +
-                "        o.create_time AS o_cre_time,\n" +
-                "        o.pay_time AS o_pay_time,\n" +
-                "        -- 行级聚合：明细表计算实际支付金额（单价*数量），过滤无效订单项\n" +
-                "        SUM(oi.goods_price * oi.goods_num) AS o_item_amt,\n" +
-                "        COUNT(oi.item_id) AS o_item_count,  -- 订单包含商品数\n" +
-                "        AVG(oi.goods_price) AS o_avg_price  -- 订单商品平均单价\n" +
-                "    FROM t_order o\n" +
-                "    INNER JOIN t_order_item oi\n" +
-                "        ON o.order_id = oi.order_id\n" +
-                "        AND o.order_date = oi.order_date  -- 分区字段关联，提升JOIN效率\n" +
-                "    WHERE o.order_date = '2026-02-04'\n" +
-                "      AND oi.goods_num > 0  -- 过滤0数量订单项\n" +
-                "      AND o.order_amount > 0\n" +
-                "    GROUP BY o.order_id, o.user_id, o.order_amount, o.pay_status, o.create_time, o.pay_time\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE3：查询前置CTE】关联CTE1(用户)和CTE2(订单JOIN结果)，新增条件函数+字段加工\n" +
-                "cte_user_order AS (\n" +
-                "    SELECT\n" +
-                "        bu.uid,\n" +
-                "        bu.uname,\n" +
-                "        bu.ulevel,\n" +
-                "        bu.reg_time,\n" +
-                "        oj.oid,\n" +
-                "        oj.o_total_amt,\n" +
-                "        oj.o_item_amt,\n" +
-                "        oj.o_item_count,\n" +
-                "        oj.o_avg_price,\n" +
-                "        oj.pay_sts,\n" +
-                "        oj.o_cre_time,\n" +
-                "        oj.o_pay_time,\n" +
-                "        -- 条件函数：将支付状态转为文字，血缘覆盖CASE WHEN\n" +
-                "        CASE oj.pay_sts\n" +
-                "            WHEN 1 THEN 'PAID'\n" +
-                "            WHEN 0 THEN 'UNPAID'\n" +
-                "            WHEN 2 THEN 'REFUND'\n" +
-                "            ELSE 'UNKNOWN'\n" +
-                "        END AS pay_status_desc,\n" +
-                "        -- 日期函数：计算下单到支付的时长（秒），血缘覆盖TIMESTAMPDIFF\n" +
-                "        TIMESTAMPDIFF(SECOND, oj.o_cre_time, oj.o_pay_time) AS pay_duration_sec\n" +
-                "    FROM cte_base_user bu\n" +
-                "    LEFT JOIN cte_order_join oj\n" +
-                "        ON bu.uid = oj.uid\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE4：自引用CTE+聚合函数】基于CTE3做用户维度聚合统计，覆盖SUM/COUNT/DISTINCT/IF\n" +
-                "cte_user_agg AS (\n" +
-                "    SELECT\n" +
-                "        uid,\n" +
-                "        uname,\n" +
-                "        ulevel,\n" +
-                "        reg_time,\n" +
-                "        -- 聚合函数：用户总订单数（含所有状态）\n" +
-                "        COUNT(DISTINCT oid) AS total_order_count,\n" +
-                "        -- 聚合函数：用户已支付订单数（条件计数，血缘覆盖IF+COUNT）\n" +
-                "        COUNT(IF(pay_sts = 1, oid, NULL)) AS paid_order_count,\n" +
-                "        -- 聚合函数：用户已支付订单总金额（过滤退款/未支付，血缘覆盖SUM+WHERE）\n" +
-                "        SUM(IF(pay_sts = 1, o_total_amt, 0)) AS paid_total_amt,\n" +
-                "        -- 聚合函数：用户已支付订单平均商品数\n" +
-                "        AVG(IF(pay_sts = 1, o_item_count, NULL)) AS paid_avg_item_count,\n" +
-                "        -- 聚合函数：用户平均支付时长（仅已支付订单）\n" +
-                "        AVG(IF(pay_sts = 1, pay_duration_sec, NULL)) AS avg_pay_duration_sec,\n" +
-                "        -- 比例计算：已支付订单占比（保留2位小数）\n" +
-                "        ROUND(COUNT(IF(pay_sts = 1, oid, NULL)) / COUNT(DISTINCT oid), 2) AS paid_order_rate\n" +
-                "    FROM cte_user_order\n" +
-                "    GROUP BY uid, uname, ulevel, reg_time\n" +
-                "    HAVING total_order_count > 0  -- 过滤无订单用户\n" +
-                "),\n" +
-                "\n" +
-                "-- 【CTE5：窗口函数+分组】基于CTE4做用户等级维度排名，覆盖ROW_NUMBER/PARTITION BY\n" +
-                "cte_user_rnk AS (\n" +
-                "    SELECT\n" +
-                "        *,\n" +
-                "        -- 窗口函数：按用户等级分组，已支付金额降序排名，血缘覆盖窗口函数\n" +
-                "        ROW_NUMBER() OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_rnk,\n" +
-                "        -- 窗口函数：按用户等级分组，已支付金额累计求和，血缘覆盖SUM窗口\n" +
-                "        SUM(paid_total_amt) OVER (PARTITION BY ulevel ORDER BY paid_total_amt DESC) AS level_paid_amt_cum\n" +
-                "    FROM cte_user_agg\n" +
-                ")\n" +
-                "\n" +
-                "-- 【主查询：多CTE关联+最终过滤】关联CTE3(明细)和CTE5(聚合+排名)，输出全量血缘字段\n" +
-                "SELECT\n" +
-                "    -- 聚合层字段（来自CTE5）\n" +
-                "    rnk.uid,\n" +
-                "    rnk.uname,\n" +
-                "    rnk.ulevel,\n" +
-                "    rnk.reg_time,\n" +
-                "    rnk.total_order_count,\n" +
-                "    rnk.paid_order_count,\n" +
-                "    rnk.paid_total_amt,\n" +
-                "    rnk.paid_avg_item_count,\n" +
-                "    rnk.avg_pay_duration_sec,\n" +
-                "    rnk.paid_order_rate,\n" +
-                "    rnk.level_rnk,\n" +
-                "    rnk.level_paid_amt_cum,\n" +
-                "    -- 明细层字段（来自CTE3）\n" +
-                "    ord.oid,\n" +
-                "    ord.o_total_amt,\n" +
-                "    ord.o_item_amt,\n" +
-                "    ord.o_item_count,\n" +
-                "    ord.pay_sts,\n" +
-                "    ord.pay_status_desc,\n" +
-                "    ord.o_cre_time,\n" +
-                "    ord.o_pay_time,\n" +
-                "    ord.pay_duration_sec,\n" +
-                "    -- 常量字段：血缘覆盖常量值\n" +
-                "    '2026-02-04' AS data_date,\n" +
-                "    -- 函数嵌套：血缘覆盖多层函数（ISNULL+CAST）\n" +
-                "    CAST(ISNULL(ord.pay_duration_sec, 0) AS BIGINT) AS pay_duration_sec_nn  -- 空值填充为0\n" +
-                "FROM cte_user_rnk rnk\n" +
-                "LEFT JOIN cte_user_order ord\n" +
-                "    ON rnk.uid = ord.uid\n" +
-                "WHERE rnk.paid_order_count > 0  -- 最终过滤：仅保留有已支付订单的用户\n" +
-                "ORDER BY\n" +
-                "    rnk.ulevel ASC,\n" +
-                "    rnk.level_rnk ASC,\n" +
-                "    ord.o_cre_time ASC;";
+        sql = "insert into default.t_user_copy select * from t_user";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
