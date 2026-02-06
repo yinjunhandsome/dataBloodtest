@@ -425,12 +425,12 @@ public class LogicalPlanLineageParser {
                 String fieldName;
                 try {
                     //todo 这里需要再严谨判断,到底需不需要这么取全名
-//                    if (expr instanceof AttributeReference) {
-//                        fieldName=handleProjectExprName(expr.qualifiedName());
-//                    }
-//                    else {
+                    if (expr instanceof AttributeReference) {
+                        fieldName=handleProjectExprName(expr.qualifiedName());
+                    }
+                    else {
                         fieldName = expr.name();
-//                    }
+                    }
                     if (fieldName == null) {
                         continue;
                     }
@@ -804,22 +804,38 @@ public class LogicalPlanLineageParser {
     // ==================== 集合操作 ====================
 
     private static Map<String, FieldLineage> parseUnion(Union plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        Map<String, FieldLineage> result = new HashMap<>();
+        Map<String, FieldLineage> childFieldLineage = new HashMap<>();
         Seq<LogicalPlan> children = plan.children();
         if (children != null && !children.isEmpty()) {
             Iterator<LogicalPlan> it = children.iterator();
             while (it.hasNext()) {
                 Map<String, FieldLineage> child = parseLogicalPlan(it.next(), cteCache);
                 for (Map.Entry<String, FieldLineage> entry : child.entrySet()) {
-                    if (result.containsKey(entry.getKey())) {
-                        FieldLineage fieldLineage = result.get(entry.getKey());
+                    if (childFieldLineage.containsKey(entry.getKey())) {
+                        FieldLineage fieldLineage = childFieldLineage.get(entry.getKey());
                         fieldLineage.getDependencies().add(entry.getValue());
                     }
                     else  {
-                        result.put(entry.getKey(), entry.getValue());
+                        childFieldLineage.put(entry.getKey(), entry.getValue());
                     }
                 }
             }
+        }
+        Map<String, FieldLineage> result = new HashMap<>();
+        Seq<Attribute> output = plan.output();
+        Iterator<Attribute> iterator = output.iterator();
+        while (iterator.hasNext()) {
+            Attribute attribute = iterator.next();
+            FieldLineage fieldLineage = new FieldLineage();
+            fieldLineage.setFieldName(attribute.name());
+            fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+            for (Map.Entry<String, FieldLineage> entry : childFieldLineage.entrySet()) {
+                String[] split = entry.getKey().split("\\.");
+                if (split[split.length - 1].equals(attribute.name())) {
+                    fieldLineage.getDependencies().add(entry.getValue());
+                }
+            }
+            result.put(attribute.name(), fieldLineage);
         }
         return result;
     }
