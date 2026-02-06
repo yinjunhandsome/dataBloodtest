@@ -1198,48 +1198,48 @@ public class LogicalPlanLineageParser {
         if (fieldName == null || childFields == null) {
             return null;
         }
-
-        // 1. 精确匹配
-        FieldLineage field = childFields.get(fieldName);
-        if (field != null) {
-            return field;
-        }
-
-        //todo 如果左右加了短名称作为区别的话，需要去掉再次判断 提取短字段名（去掉前缀）
-        String shortName = null;
-        if (fieldName.contains(".")) {
-            shortName = fieldName.substring(fieldName.lastIndexOf('.') + 1);
-        }
-        else {
-            shortName= fieldName;
-        }
-        // 2. 尝试用短字段名匹配
-        field = childFields.get(shortName);
-        if (field != null) {
-            return field;
-        }
-        // 3. 遍历所有字段，尝试匹配字段名部分
-        for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
-            String childFieldName = entry.getKey();
-
-            // 如果输入字段名等于child字段名（不分大小写）
-            if (fieldName.equalsIgnoreCase(childFieldName)) {
-                return entry.getValue();
+        String[] split = fieldName.split("\\.");
+        if (split.length==1) {
+            String shortName=split[0];
+            FieldLineage fieldLineage = childFields.get(shortName);
+            if (fieldLineage != null) {
+                return fieldLineage;
             }
-
-            // 如果都有短名称，比较短名称
-            if (shortName != null) {
-                String childShortName = childFieldName;
-                if (childFieldName.contains(".")) {
-                    childShortName = childFieldName.substring(childFieldName.lastIndexOf('.') + 1);
-                }
-
-                if (shortName.equalsIgnoreCase(childShortName)) {
-                    return entry.getValue();
+            else {
+                for (Map.Entry<String, FieldLineage> child : childFields.entrySet()) {
+                    String[] children = child.getKey().split("\\.");
+                    if (children.length>1) {
+                        if (StringUtils.equals(children[children.length-1], shortName)) {
+                            return child.getValue();
+                        }
+                    }
                 }
             }
         }
+        else  {
+            String shortName=split[split.length-2]+"."+split[split.length-1];
+            FieldLineage fieldLineage = childFields.get(shortName);
+            if (fieldLineage != null) {
+                return fieldLineage;
+            }
+            else {
+                for (Map.Entry<String, FieldLineage> child : childFields.entrySet()) {
+                    String[] children = child.getKey().split("\\.");
+                    if (children.length==1) {
+                        if (StringUtils.equals(children[0], split[split.length-1])) {
+                            return child.getValue();
+                        }
+                    }
+                    else {
+                        String childShortName = children[children.length-2]+"."+children[children.length-1];
+                        if (StringUtils.equals(childShortName, shortName)) {
+                            return child.getValue();
+                        }
+                    }
 
+                }
+            }
+        }
         return null;
     }
 
