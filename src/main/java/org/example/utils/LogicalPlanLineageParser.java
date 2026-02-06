@@ -164,12 +164,14 @@ public class LogicalPlanLineageParser {
             if (plan instanceof InsertIntoHadoopFsRelationCommand) {
                 return parseInsertIntoHadoopFsRelationCommand((InsertIntoHadoopFsRelationCommand) plan, cteCache);
             }
-            if (plan instanceof SaveIntoDataSourceCommand) {
-                return parseSaveIntoDataSourceCommand((SaveIntoDataSourceCommand) plan, cteCache);
-            }
-            if (plan instanceof CreateDataSourceTableCommand) {
-                return parseCreateDataSourceTableCommand((CreateDataSourceTableCommand) plan, cteCache);
-            }
+            //todo 这个是spark自己管理的catalog表的算子，暂时不确定要不要处理，需确定spark操作的表是否都是hive表
+//            if (plan instanceof SaveIntoDataSourceCommand) {
+//                return parseSaveIntoDataSourceCommand((SaveIntoDataSourceCommand) plan, cteCache);
+//            }
+            //todo 这个是spark自己管理的catalog表的算子，暂时不确定要不要处理，需确定spark操作的表是否都是hive表
+//            if (plan instanceof CreateDataSourceTableCommand) {
+//                return parseCreateDataSourceTableCommand((CreateDataSourceTableCommand) plan, cteCache);
+//            }
             if (plan instanceof CreateTableCommand) {
                 return parseCreateTableCommand((CreateTableCommand) plan, cteCache);
             }
@@ -202,10 +204,10 @@ public class LogicalPlanLineageParser {
                 return parseAnalyzeTableCommand((AnalyzeTableCommand) plan);
             }
 
-            // V2 Write操作
-            if (plan instanceof AppendData) {
-                return parseAppendData((AppendData) plan, cteCache);
-            }
+            // 湖表
+//            if (plan instanceof AppendData) {
+//                return parseAppendData((AppendData) plan, cteCache);
+//            }
             if (plan instanceof OverwriteByExpression) {
                 return parseOverwriteByExpression((OverwriteByExpression) plan, cteCache);
             }
@@ -824,10 +826,6 @@ public class LogicalPlanLineageParser {
     }
 
     private static Map<String, FieldLineage> parseInsertIntoHadoopFsRelationCommand(InsertIntoHadoopFsRelationCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        System.out.println("===== DEBUG: InsertIntoHadoopFsRelationCommand =====");
-        System.out.println("Output path: " + plan.outputPath());
-        System.out.println("File format: " + plan.fileFormat());
-
         // 获取写入逻辑计划，解析其血缘
         LogicalPlan query = plan.query();
         Map<String, FieldLineage> result = parseLogicalPlan(query, cteCache);
@@ -893,8 +891,6 @@ public class LogicalPlanLineageParser {
         String dbName = plan.table().identifier().database().getOrElse(()->"default");
         String fullName = dbName + "." + tableName;
         boolean overwrite = plan.overwrite();
-        System.out.println("Target table: " + tableName);
-        System.out.println("Overwrite: " + overwrite);
 
         // 解析查询部分的血缘
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
@@ -949,7 +945,6 @@ public class LogicalPlanLineageParser {
      * CREATE TABLE table_name (schema)
      */
     private static Map<String, FieldLineage> parseCreateTableCommand(CreateTableCommand plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        System.out.println("===== DEBUG: CreateTableCommand =====");
         String tableName = plan.toString();
         System.out.println("Created table: " + tableName);
         // 创建空表，无血缘数据
@@ -961,7 +956,6 @@ public class LogicalPlanLineageParser {
      * DROP TABLE table_name
      */
     private static Map<String, FieldLineage> parseDropTableCommand(DropTableCommand plan) {
-        System.out.println("===== DEBUG: DropTableCommand =====");
         String tableName = plan.tableName().toString();
         System.out.println("Dropped table: " + tableName);
         // 删除表操作，无血缘数据
@@ -973,7 +967,6 @@ public class LogicalPlanLineageParser {
      * ALTER TABLE table_name ADD PARTITION (partition_spec)
      */
     private static Map<String, FieldLineage> parseAlterTableAddPartitionCommand(AlterTableAddPartitionCommand plan) {
-        System.out.println("===== DEBUG: AlterTableAddPartitionCommand =====");
         String tableName = plan.toString();
         System.out.println("Added partition to table: " + tableName);
         // 添加分区操作，无血缘数据
@@ -985,7 +978,6 @@ public class LogicalPlanLineageParser {
      * ALTER TABLE table_name DROP PARTITION (partition_spec)
      */
     private static Map<String, FieldLineage> parseAlterTableDropPartitionCommand(AlterTableDropPartitionCommand plan) {
-        System.out.println("===== DEBUG: AlterTableDropPartitionCommand =====");
         String tableName = plan.toString();
         System.out.println("Dropped partition from table: " + tableName);
         // 删除分区操作，无血缘数据
@@ -1017,7 +1009,6 @@ public class LogicalPlanLineageParser {
      * REFRESH TABLE table_name
      */
     private static Map<String, FieldLineage> parseRefreshTableCommand(RefreshTableCommand plan) {
-        System.out.println("===== DEBUG: RefreshTableCommand =====");
         String tableName = plan.toString();
         System.out.println("Refreshed table: " + tableName);
         // 刷新表操作，无血缘数据
@@ -1029,7 +1020,6 @@ public class LogicalPlanLineageParser {
      * SHOW TABLES
      */
     private static Map<String, FieldLineage> parseShowTablesCommand() {
-        System.out.println("===== DEBUG: ShowTablesCommand =====");
         System.out.println("Showed all tables");
         // 查询操作，无血缘数据
         return new HashMap<>();
@@ -1040,7 +1030,6 @@ public class LogicalPlanLineageParser {
      * SHOW COLUMNS FROM table_name
      */
     private static Map<String, FieldLineage> parseShowColumnsCommand(ShowColumnsCommand plan) {
-        System.out.println("===== DEBUG: ShowColumnsCommand =====");
         String tableName = plan.toString();
         System.out.println("Showed columns from table: " + tableName);
         // 查询操作，无血缘数据
@@ -1052,7 +1041,6 @@ public class LogicalPlanLineageParser {
      * SHOW PARTITIONS table_name
      */
     private static Map<String, FieldLineage> parseShowPartitionsCommand(ShowPartitionsCommand plan) {
-        System.out.println("===== DEBUG: ShowPartitionsCommand =====");
         String tableName = plan.toString();
         System.out.println("Showed partitions from table: " + tableName);
         // 查询操作，无血缘数据
@@ -1064,7 +1052,6 @@ public class LogicalPlanLineageParser {
      * DESCRIBE TABLE table_name
      */
     private static Map<String, FieldLineage> parseDescribeTableCommand(DescribeTableCommand plan) {
-        System.out.println("===== DEBUG: DescribeTableCommand =====");
         String tableName = plan.toString();
         System.out.println("Described table: " + tableName);
         // 查询操作，无血缘数据
@@ -1076,7 +1063,6 @@ public class LogicalPlanLineageParser {
      * ANALYZE TABLE table_name COMPUTE STATISTICS
      */
     private static Map<String, FieldLineage> parseAnalyzeTableCommand(AnalyzeTableCommand plan) {
-        System.out.println("===== DEBUG: AnalyzeTableCommand =====");
         String tableName = plan.toString();
         System.out.println("Analyzed table: " + tableName);
         // 分析操作，无血缘数据
@@ -1190,10 +1176,6 @@ public class LogicalPlanLineageParser {
         return deps;
     }
 
-    /**
-     * 在childFields中查找字段，支持带前缀的字段名匹配
-     * 例如：rnk.uid 可以匹配 uid 或 rnk.uid
-     */
     private static FieldLineage findFieldInChildFields(String fieldName, Map<String, FieldLineage> childFields) {
         if (fieldName == null || childFields == null) {
             return null;
@@ -1429,7 +1411,9 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "insert into default.t_user_copy select * from t_user";
+        sql = "INSERT OVERWRITE default.t_test_overwrite PARTITION (register_date='2026-02-06')\n" +
+                "SELECT 'user_004', '赵六' UNION ALL\n" +
+                "SELECT 'user_005', '孙七';";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
