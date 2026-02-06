@@ -4,6 +4,7 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.analysis.*;
 import org.apache.spark.sql.catalyst.catalog.CatalogTable;
+import org.apache.spark.sql.catalyst.catalog.HiveTableRelation;
 import org.apache.spark.sql.catalyst.expressions.*;
 import org.apache.spark.sql.catalyst.expressions.aggregate.*;
 import org.apache.spark.sql.catalyst.parser.ParseException;
@@ -85,6 +86,9 @@ public class LogicalPlanLineageParser {
             if (plan instanceof LogicalRelation) {
                 return parseLogicalRelation((LogicalRelation) plan);
             }
+            if (plan instanceof HiveTableRelation) {
+                return parseHiveTableRelation((HiveTableRelation) plan);
+            }
             if (plan instanceof UnresolvedRelation) {
                 return parseUnresolvedRelation((UnresolvedRelation) plan);
             }
@@ -155,6 +159,9 @@ public class LogicalPlanLineageParser {
             }
 
             // ==================== 建表和写入算子 ====================
+            if (plan instanceof LoadDataCommand) {
+                return parseLoadData((LoadDataCommand) plan);
+            }
             if (plan instanceof CreateHiveTableAsSelectCommand) {
                 return parseCreateHiveTableAsSelectCommand((CreateHiveTableAsSelectCommand) plan, cteCache);
             }
@@ -369,6 +376,29 @@ public class LogicalPlanLineageParser {
 
         return result;
     }
+    private static Map<String, FieldLineage> parseHiveTableRelation(HiveTableRelation plan) {
+        Map<String, FieldLineage> result = new HashMap<>();
+        String dbName = StringUtils.isBlank(plan.tableMeta().database())?"default":plan.tableMeta().database();
+        String tblName = plan.tableMeta().identifier().table();
+        String fullTableName = dbName + "." + tblName;
+        Seq<AttributeReference> output = plan.dataCols();
+        if (output != null && !output.isEmpty()) {
+            Iterator<AttributeReference> it = output.iterator();
+            while (it.hasNext()) {
+                Attribute attr = it.next();
+                if (attr != null) {
+                    String fieldName = attr.name();
+                    FieldLineage lineage = new FieldLineage(fieldName, fullTableName);
+                    lineage.setFieldType(FieldLineage.FieldType.COLUMN);
+                    lineage.setSourceTableName(fullTableName);
+                    result.put(fieldName, lineage);
+                }
+            }
+        }
+        return result;
+    }
+
+
 
     private static Map<String, FieldLineage> parseUnresolvedRelation(UnresolvedRelation plan) {
         // 未解析表，返回空血缘
@@ -394,13 +424,13 @@ public class LogicalPlanLineageParser {
                 // 安全获取字段名
                 String fieldName;
                 try {
-                    //todo 这里需要再严谨判断
-                    if (expr instanceof AttributeReference) {
-                        fieldName=handleProjectExprName(expr.qualifiedName());
-                    }
-                    else {
+                    //todo 这里需要再严谨判断,到底需不需要这么取全名
+//                    if (expr instanceof AttributeReference) {
+//                        fieldName=handleProjectExprName(expr.qualifiedName());
+//                    }
+//                    else {
                         fieldName = expr.name();
-                    }
+//                    }
                     if (fieldName == null) {
                         continue;
                     }
@@ -590,21 +620,6 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
         Map<String, FieldLineage> result = new HashMap<>(childFields);
 
-        // 调试：打印 Window 节点的所有输出字段
-        System.out.println("===== DEBUG: Window Output =====");
-        Seq<Attribute> windowOutput = plan.output();
-        if (windowOutput != null && !windowOutput.isEmpty()) {
-            Iterator<Attribute> it = windowOutput.iterator();
-            while (it.hasNext()) {
-                Attribute attr = it.next();
-                if (attr != null) {
-                    System.out.println("  Window output: " + attr.name());
-                }
-            }
-        }
-        System.out.println("Window childFields: " + childFields.keySet());
-        System.out.println("==================================");
-
         // 添加窗口函数字段
         Seq<NamedExpression> windowExprs = plan.windowExpressions();
         if (windowExprs != null && !windowExprs.isEmpty()) {
@@ -790,16 +805,22 @@ public class LogicalPlanLineageParser {
 
     private static Map<String, FieldLineage> parseUnion(Union plan, Map<String, Map<String, FieldLineage>> cteCache) {
         Map<String, FieldLineage> result = new HashMap<>();
-
         Seq<LogicalPlan> children = plan.children();
         if (children != null && !children.isEmpty()) {
             Iterator<LogicalPlan> it = children.iterator();
-            if (it.hasNext()) {
-                // Union取第一个子计划的字段结构
-                result = parseLogicalPlan(it.next(), cteCache);
+            while (it.hasNext()) {
+                Map<String, FieldLineage> child = parseLogicalPlan(it.next(), cteCache);
+                for (Map.Entry<String, FieldLineage> entry : child.entrySet()) {
+                    if (result.containsKey(entry.getKey())) {
+                        FieldLineage fieldLineage = result.get(entry.getKey());
+                        fieldLineage.getDependencies().add(entry.getValue());
+                    }
+                    else  {
+                        result.put(entry.getKey(), entry.getValue());
+                    }
+                }
             }
         }
-
         return result;
     }
 
@@ -822,6 +843,17 @@ public class LogicalPlanLineageParser {
         if (children != null && !children.isEmpty()) {
             return parseLogicalPlan(children.head(), cteCache);
         }
+        return new HashMap<>();
+    }
+
+    /**
+     * 解析 LoadData
+     * LOAD DATA [LOCAL] INPATH 'filepath' [OVERWRITE] INTO TABLE tablename
+     */
+    private static Map<String, FieldLineage> parseLoadData(LoadDataCommand plan) {
+        // LOAD DATA 操作只是将文件数据加载到表中
+        // 由于无法从外部文件推断字段级血缘关系，返回空Map
+        // 如需追踪数据加载来源，可在此记录表名与文件路径的映射关系
         return new HashMap<>();
     }
 
@@ -1411,9 +1443,10 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "INSERT OVERWRITE default.t_test_overwrite PARTITION (register_date='2026-02-06')\n" +
-                "SELECT 'user_004', '赵六' UNION ALL\n" +
-                "SELECT 'user_005', '孙七';";
+        sql = "-- UNION去重查询：合并t_user和t_user_2的结果并去重\n" +
+                "SELECT user_id, user_name, register_time, register_date FROM default.t_user\n" +
+                "UNION\n" +
+                "SELECT user_id, user_name, register_time, register_date FROM default.t_user_copy;";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
