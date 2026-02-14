@@ -548,7 +548,8 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
         Map<String, FieldLineage> result = new HashMap<>();
 
-        // 解析Group By字段
+        // 第一步：解析 Group By 字段，并收集它们的血缘信息供后续聚合字段使用
+        List<FieldLineage> groupingFieldLineages = new ArrayList<>();
         Seq<Expression> groupingExprs = plan.groupingExpressions();
         if (groupingExprs != null && !groupingExprs.isEmpty()) {
             Iterator<Expression> it = groupingExprs.iterator();
@@ -566,13 +567,20 @@ public class LogicalPlanLineageParser {
                             System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for grouping field " + fieldName);
                         }
                     }
-
-                    result.put(fieldName, lineage);
+                    // 收集 Group By 字段的血缘，供聚合字段使用
+                    groupingFieldLineages.add(lineage);
                 }
             }
         }
 
-        // 解析聚合表达式
+        // 第二步：解析聚合表达式（如 COUNT(a) AS b）
+        // 关键修复：聚合字段的血缘应包含 Group By 字段 + 聚合函数内部字段
+        //todo 现在groupby字段的查询也是把所有groupby字段作为血缘的，  SELECT
+        //      user_id,              -- 只依赖 user_id
+        //      COUNT(order_id) AS order_count,  -- 依赖 order_id + user_id + region
+        //      SUM(amount) AS total_amount      -- 依赖 amount + user_id + region
+        //  FROM orders
+        //  GROUP BY user_id, region，比如上面，order_count依赖聚合字段和所以groupby字段，但是user_id字段其实只依赖于groupby里面的user_id
         Seq<NamedExpression> aggExprs = plan.aggregateExpressions();
         if (aggExprs != null && !aggExprs.isEmpty()) {
             Iterator<NamedExpression> it = aggExprs.iterator();
@@ -590,19 +598,35 @@ public class LogicalPlanLineageParser {
                     lineage.setExpression(expr.toString());
                 }
 
+                // 1. 先添加聚合函数内部字段的依赖
                 Set<String> depNames = extractDependencies((Expression) expr);
                 if (DEBUG_MODE && !depNames.isEmpty()) {
-                    System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
+                    System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " expression dependencies: " + depNames);
                 }
                 for (String depName : depNames) {
                     FieldLineage dep = findFieldInChildFields(depName, childFields);
                     if (dep != null) {
                         lineage.addDependency(cloneFieldLineage(dep));
                         if (DEBUG_MODE) {
-                            System.out.println("      Added dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
+                            System.out.println("      Added expression dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
                         }
                     } else {
                         System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for aggregate field " + fieldName);
+                    }
+                }
+
+                // 2. 关键修复：添加所有 Group By 字段作为依赖
+                // 因为聚合字段是在每个分组内计算的，依赖于分组键
+                if (!groupingFieldLineages.isEmpty()) {
+                    if (DEBUG_MODE) {
+                        System.out.println("    Adding " + groupingFieldLineages.size() + " grouping field dependencies to aggregate field '" + fieldName + "'");
+                    }
+                    for (FieldLineage groupingLineage : groupingFieldLineages) {
+                        // 克隆 Group By 字段的血缘作为聚合字段的依赖
+                        lineage.addDependency(cloneFieldLineage(groupingLineage));
+                        if (DEBUG_MODE) {
+                            System.out.println("      Added grouping dependency: " + groupingLineage.getFieldName() + " (total: " + lineage.getDependencies().size() + ")");
+                        }
                     }
                 }
 
