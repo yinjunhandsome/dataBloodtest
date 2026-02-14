@@ -821,23 +821,24 @@ public class LogicalPlanLineageParser {
                 }
             }
         }
-        Map<String, FieldLineage> result = new HashMap<>();
-        Seq<Attribute> output = plan.output();
-        Iterator<Attribute> iterator = output.iterator();
-        while (iterator.hasNext()) {
-            Attribute attribute = iterator.next();
-            FieldLineage fieldLineage = new FieldLineage();
-            fieldLineage.setFieldName(attribute.name());
-            fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
-            for (Map.Entry<String, FieldLineage> entry : childFieldLineage.entrySet()) {
-                String[] split = entry.getKey().split("\\.");
-                if (split[split.length - 1].equals(attribute.name())) {
-                    fieldLineage.getDependencies().add(entry.getValue());
-                }
-            }
-            result.put(attribute.name(), fieldLineage);
-        }
-        return result;
+//        Map<String, FieldLineage> result = new HashMap<>();
+//        Seq<Attribute> output = plan.output();
+//        Iterator<Attribute> iterator = output.iterator();
+//        while (iterator.hasNext()) {
+//            Attribute attribute = iterator.next();
+//            FieldLineage fieldLineage = new FieldLineage();
+//            fieldLineage.setFieldName(attribute.name());
+//            fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+//            for (Map.Entry<String, FieldLineage> entry : childFieldLineage.entrySet()) {
+//                String[] split = entry.getKey().split("\\.");
+//                if (split[split.length - 1].equals(attribute.name())) {
+//                    fieldLineage.getDependencies().add(entry.getValue());
+//                }
+//            }
+//            result.put(attribute.name(), fieldLineage);
+//        }
+//        return result;
+          return childFieldLineage;
     }
 
     private static Map<String, FieldLineage> parseIntersect(Intersect plan, Map<String, Map<String, FieldLineage>> cteCache) {
@@ -1224,6 +1225,7 @@ public class LogicalPlanLineageParser {
         return deps;
     }
 
+    //todo 重大问题
     private static FieldLineage findFieldInChildFields(String fieldName, Map<String, FieldLineage> childFields) {
         if (fieldName == null || childFields == null) {
             return null;
@@ -1262,7 +1264,10 @@ public class LogicalPlanLineageParser {
                     }
                     else {
                         String childShortName = children[children.length-2]+"."+children[children.length-1];
-                        if (StringUtils.equals(childShortName, shortName)) {
+                        FieldLineage value = child.getValue();
+                        String tableName = StringUtils.isBlank(value.getTableName())?"":value.getTableName();
+                        String aliasName = tableName+"."+children[split.length-1];
+                        if (StringUtils.equals(childShortName, shortName)||StringUtils.equals(shortName, aliasName)) {
                             return child.getValue();
                         }
                     }
@@ -1459,10 +1464,43 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "-- UNION去重查询：合并t_user和t_user_2的结果并去重\n" +
-                "SELECT user_id, user_name, register_time, register_date FROM default.t_user\n" +
-                "UNION\n" +
-                "SELECT user_id, user_name, register_time, register_date FROM default.t_user_copy;";
+        sql = "WITH user_order_2026 AS (\n" +
+                "    SELECT\n" +
+                "        u.user_id,\n" +
+                "        u.user_name,\n" +
+                "        o.order_id,\n" +
+                "        o.order_amount,\n" +
+                "        '2026' AS year_tag\n" +
+                "    FROM t_user u\n" +
+                "    INNER JOIN t_order o ON u.user_id = o.user_id\n" +
+                "    WHERE o.order_date >= '2026-01-01'\n" +
+                "),\n" +
+                "user_order_2025 AS (\n" +
+                "    SELECT\n" +
+                "        u.user_id,\n" +
+                "        u.user_name,\n" +
+                "        o.order_id,\n" +
+                "        o.order_amount,\n" +
+                "        '2025' AS year_tag\n" +
+                "    FROM t_user u\n" +
+                "    INNER JOIN t_order o ON u.user_id = o.user_id\n" +
+                "    WHERE o.order_date < '2026-01-01'\n" +
+                ")\n" +
+                "SELECT\n" +
+                "    user_id,\n" +
+                "    user_name,\n" +
+                "    COUNT(order_id) AS order_count,\n" +
+                "    SUM(order_amount) AS total_consume,\n" +
+                "    MAX(order_amount) AS max_order,\n" +
+                "    MIN(order_amount) AS min_order,\n" +
+                "    -- 测试不存在字段\n" +
+                "    u.nonexistent_user_field_2\n" +
+                "FROM (\n" +
+                "    SELECT * FROM user_order_2026\n" +
+                "    UNION\n" +
+                "    SELECT * FROM user_order_2025\n" +
+                ") u\n" +
+                "GROUP BY user_id, user_name;";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
