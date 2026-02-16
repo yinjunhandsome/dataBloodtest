@@ -21,6 +21,7 @@ import scala.collection.Iterator;
 import scala.collection.Seq;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Spark LogicalPlan 字段级血缘解析器
@@ -574,13 +575,9 @@ public class LogicalPlanLineageParser {
         }
 
         // 第二步：解析聚合表达式（如 COUNT(a) AS b）
-        // 关键修复：聚合字段的血缘应包含 Group By 字段 + 聚合函数内部字段
-        //todo 现在groupby字段的查询也是把所有groupby字段作为血缘的，  SELECT
-        //      user_id,              -- 只依赖 user_id
-        //      COUNT(order_id) AS order_count,  -- 依赖 order_id + user_id + region
-        //      SUM(amount) AS total_amount      -- 依赖 amount + user_id + region
-        //  FROM orders
-        //  GROUP BY user_id, region，比如上面，order_count依赖聚合字段和所以groupby字段，但是user_id字段其实只依赖于groupby里面的user_id
+        // 关键修复：区分非聚合字段和聚合字段
+        // - 非聚合字段（直接SELECT的Group By字段，如user_id）：只依赖它自己
+        // - 聚合字段（如COUNT(order_id)、SUM(amount)）：依赖聚合函数内部字段 + 所有Group By字段
         Seq<NamedExpression> aggExprs = plan.aggregateExpressions();
         if (aggExprs != null && !aggExprs.isEmpty()) {
             Iterator<NamedExpression> it = aggExprs.iterator();
@@ -590,7 +587,7 @@ public class LogicalPlanLineageParser {
 
                 String fieldName = expr.name();
                 FieldLineage lineage = new FieldLineage(fieldName, "AGGREGATE");
-                lineage.setFieldType(FieldLineage.FieldType.AGGREGATE);
+
                 // 安全获取SQL表达式
                 try {
                     lineage.setExpression(((Expression) expr).sql());
@@ -598,41 +595,75 @@ public class LogicalPlanLineageParser {
                     lineage.setExpression(expr.toString());
                 }
 
-                // 1. 先添加聚合函数内部字段的依赖
-                Set<String> depNames = extractDependencies((Expression) expr);
-                if (DEBUG_MODE && !depNames.isEmpty()) {
-                    System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " expression dependencies: " + depNames);
-                }
-                for (String depName : depNames) {
-                    FieldLineage dep = findFieldInChildFields(depName, childFields);
-                    if (dep != null) {
-                        lineage.addDependency(cloneFieldLineage(dep));
-                        if (DEBUG_MODE) {
-                            System.out.println("      Added expression dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
-                        }
-                    } else {
-                        System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for aggregate field " + fieldName);
-                    }
-                }
+                // 判断是否包含聚合函数
+                boolean hasAggregateFunction = containsAggregateFunction((Expression) expr);
 
-                // 2. 关键修复：添加所有 Group By 字段作为依赖
-                // 因为聚合字段是在每个分组内计算的，依赖于分组键
-                if (!groupingFieldLineages.isEmpty()) {
+                if (hasAggregateFunction) {
+                    // === 聚合字段（如 COUNT(order_id) AS order_count） ===
+                    lineage.setFieldType(FieldLineage.FieldType.AGGREGATE);
+
+                    // 1. 先添加聚合函数内部字段的依赖
+                    Set<String> depNames = extractDependencies((Expression) expr);
+                    if (DEBUG_MODE && !depNames.isEmpty()) {
+                        System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " expression dependencies: " + depNames);
+                    }
+                    for (String depName : depNames) {
+                        FieldLineage dep = findFieldInChildFields(depName, childFields);
+                        if (dep != null) {
+                            lineage.addDependency(cloneFieldLineage(dep));
+                            if (DEBUG_MODE) {
+                                System.out.println("      Added expression dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
+                            }
+                        } else {
+                            System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for aggregate field " + fieldName);
+                        }
+                    }
+
+                    // 2. 添加所有 Group By 字段作为依赖
+                    // 因为聚合字段是在每个分组内计算的，依赖于分组键
+                    if (!groupingFieldLineages.isEmpty()) {
+                        if (DEBUG_MODE) {
+                            System.out.println("    Adding " + groupingFieldLineages.size() + " grouping field dependencies to aggregate field '" + fieldName + "'");
+                        }
+                        for (FieldLineage groupingLineage : groupingFieldLineages) {
+                            // 克隆 Group By 字段的血缘作为聚合字段的依赖
+                            lineage.addDependency(cloneFieldLineage(groupingLineage));
+                            if (DEBUG_MODE) {
+                                System.out.println("      Added grouping dependency: " + groupingLineage.getFieldName() + " (total: " + lineage.getDependencies().size() + ")");
+                            }
+                        }
+                    }
+
                     if (DEBUG_MODE) {
-                        System.out.println("    Adding " + groupingFieldLineages.size() + " grouping field dependencies to aggregate field '" + fieldName + "'");
+                        System.out.println("    Aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
                     }
-                    for (FieldLineage groupingLineage : groupingFieldLineages) {
-                        // 克隆 Group By 字段的血缘作为聚合字段的依赖
-                        lineage.addDependency(cloneFieldLineage(groupingLineage));
-                        if (DEBUG_MODE) {
-                            System.out.println("      Added grouping dependency: " + groupingLineage.getFieldName() + " (total: " + lineage.getDependencies().size() + ")");
+                } else {
+                    // === 非聚合字段（直接SELECT的Group By字段，如 user_id） ===
+                    // 只添加它自己的依赖，不添加所有Group By字段
+                    lineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+                    // 只提取字段自身的依赖
+                    Set<String> depNames = extractDependencies((Expression) expr);
+                    if (DEBUG_MODE && !depNames.isEmpty()) {
+                        System.out.println("    Non-aggregate field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
+                    }
+                    for (String depName : depNames) {
+                        FieldLineage dep = findFieldInChildFields(depName, childFields);
+                        if (dep != null) {
+                            lineage.addDependency(cloneFieldLineage(dep));
+                            if (DEBUG_MODE) {
+                                System.out.println("      Added dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
+                            }
+                        } else {
+                            System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for field " + fieldName);
                         }
+                    }
+
+                    if (DEBUG_MODE) {
+                        System.out.println("    Non-aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
                     }
                 }
 
-                if (DEBUG_MODE) {
-                    System.out.println("    Aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
-                }
                 result.put(fieldName, lineage);
             }
         }
@@ -1216,6 +1247,33 @@ public class LogicalPlanLineageParser {
     // ==================== 辅助方法 ====================
 
     /**
+     * 判断表达式是否包含聚合函数
+     */
+    private static boolean containsAggregateFunction(Expression expr) {
+        if (expr == null) {
+            return false;
+        }
+
+        // 如果本身就是聚合函数，返回true
+        if (expr instanceof AggregateFunction) {
+            return true;
+        }
+
+        // 递归检查子表达式
+        Seq<Expression> children = expr.children();
+        if (children != null && !children.isEmpty()) {
+            Iterator<Expression> it = children.iterator();
+            while (it.hasNext()) {
+                if (containsAggregateFunction(it.next())) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * 从表达式中提取依赖的字段名
      */
     private static Set<String> extractDependencies(Expression expr) {
@@ -1488,43 +1546,19 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "WITH user_order_2026 AS (\n" +
-                "    SELECT\n" +
-                "        u.user_id,\n" +
-                "        u.user_name,\n" +
-                "        o.order_id,\n" +
-                "        o.order_amount,\n" +
-                "        '2026' AS year_tag\n" +
-                "    FROM t_user u\n" +
-                "    INNER JOIN t_order o ON u.user_id = o.user_id\n" +
-                "    WHERE o.order_date >= '2026-01-01'\n" +
-                "),\n" +
-                "user_order_2025 AS (\n" +
-                "    SELECT\n" +
-                "        u.user_id,\n" +
-                "        u.user_name,\n" +
-                "        o.order_id,\n" +
-                "        o.order_amount,\n" +
-                "        '2025' AS year_tag\n" +
-                "    FROM t_user u\n" +
-                "    INNER JOIN t_order o ON u.user_id = o.user_id\n" +
-                "    WHERE o.order_date < '2026-01-01'\n" +
-                ")\n" +
-                "SELECT\n" +
-                "    user_id,\n" +
-                "    user_name,\n" +
-                "    COUNT(order_id) AS order_count,\n" +
-                "    SUM(order_amount) AS total_consume,\n" +
-                "    MAX(order_amount) AS max_order,\n" +
-                "    MIN(order_amount) AS min_order,\n" +
-                "    -- 测试不存在字段\n" +
-                "    u.nonexistent_user_field_2\n" +
-                "FROM (\n" +
-                "    SELECT * FROM user_order_2026\n" +
-                "    UNION\n" +
-                "    SELECT * FROM user_order_2025\n" +
-                ") u\n" +
-                "GROUP BY user_id, user_name;";
+        sql = "SELECT\n" +
+                "  u.user_id,\n" +
+                "  u.user_name,\n" +
+                "  COUNT(DISTINCT o.order_id) AS user_order_count,  -- 聚合+去重\n" +
+                "  SUM(oi.goods_price * oi.goods_num) AS user_goods_total,  -- 计算+聚合\n" +
+                "  MAX(o.order_amount) AS max_single_order,  -- 聚合函数\n" +
+                "  MIN(o.pay_time) AS first_pay_time,  -- 时间类聚合\n" +
+                "  u.nonexistent_user_phone AS null_field  -- 不存在字段\n" +
+                "FROM default.t_user u\n" +
+                "LEFT JOIN default.t_order o ON u.user_id = o.user_id\n" +
+                "LEFT JOIN default.t_order_item oi ON o.order_id = oi.order_id\n" +
+                "WHERE o.order_status = 'PAID'\n" +
+                "GROUP BY u.user_id, u.user_name;";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
