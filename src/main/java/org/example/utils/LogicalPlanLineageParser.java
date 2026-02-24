@@ -44,7 +44,7 @@ public class LogicalPlanLineageParser {
 
     // ==================== 调试开关 ====================
     // 设为false关闭所有调试输出，设为true开启详细日志
-    private static final boolean DEBUG_MODE = false;
+    private static final boolean DEBUG_MODE = true;
 
 
     /**
@@ -547,31 +547,74 @@ public class LogicalPlanLineageParser {
 
     private static Map<String, FieldLineage> parseAggregate(Aggregate plan, Map<String, Map<String, FieldLineage>> cteCache) {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
+
+        if (DEBUG_MODE) {
+            System.out.println("===== DEBUG: parseAggregate - childFields =====");
+            System.out.println("Number of childFields: " + childFields.size());
+            for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
+                System.out.println("  " + entry.getKey() + " -> " + entry.getValue().getSourceTableName());
+            }
+        }
+
         Map<String, FieldLineage> result = new HashMap<>();
 
         // 第一步：解析 Group By 字段，并收集它们的血缘信息供后续聚合字段使用
         List<FieldLineage> groupingFieldLineages = new ArrayList<>();
         Seq<Expression> groupingExprs = plan.groupingExpressions();
+        if (DEBUG_MODE) {
+            System.out.println("===== DEBUG: parseAggregate - GROUP BY expressions =====");
+            System.out.println("Number of GROUP BY expressions: " + (groupingExprs != null ? groupingExprs.size() : 0));
+        }
         if (groupingExprs != null && !groupingExprs.isEmpty()) {
             Iterator<Expression> it = groupingExprs.iterator();
             while (it.hasNext()) {
                 Expression expr = it.next();
-                if (expr instanceof NamedExpression) {
-                    String fieldName = ((NamedExpression) expr).name();
-                    FieldLineage lineage = new FieldLineage(fieldName, "AGGREGATE");
-                    Set<String> depNames = extractDependencies(expr);
-                    for (String depName : depNames) {
-                        FieldLineage dep = findFieldInChildFields(depName, childFields);
-                        if (dep != null) {
-                            lineage.addDependency(cloneFieldLineage(dep));
-                        } else {
-                            System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for grouping field " + fieldName);
-                        }
+                if (DEBUG_MODE) {
+                    System.out.println("  GROUP BY expression: " + expr.getClass().getSimpleName() + " - " + expr);
+                }
+
+                // 获取字段名：支持 AttributeReference 和 NamedExpression
+                String fieldName;
+                if (expr instanceof AttributeReference) {
+                    fieldName = ((AttributeReference) expr).name();
+                    if (DEBUG_MODE) {
+                        System.out.println("    -> AttributeReference, name = " + fieldName);
                     }
-                    // 收集 Group By 字段的血缘，供聚合字段使用
-                    groupingFieldLineages.add(lineage);
+                } else if (expr instanceof NamedExpression) {
+                    fieldName = ((NamedExpression) expr).name();
+                    if (DEBUG_MODE) {
+                        System.out.println("    -> NamedExpression, name = " + fieldName);
+                    }
+                } else {
+                    // 其他类型（如表达式），跳过
+                    if (DEBUG_MODE) {
+                        System.out.println("    -> Skipping (not AttributeReference or NamedExpression)");
+                    }
+                    continue;
+                }
+
+                FieldLineage lineage = new FieldLineage(fieldName, "AGGREGATE");
+                Set<String> depNames = extractDependencies(expr);
+                if (DEBUG_MODE) {
+                    System.out.println("    -> Extracted dependencies: " + depNames);
+                }
+                for (String depName : depNames) {
+                    FieldLineage dep = findFieldInChildFields(depName, childFields);
+                    if (dep != null) {
+                        lineage.addDependency(cloneFieldLineage(dep));
+                    } else {
+                        System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for grouping field " + fieldName);
+                    }
+                }
+                // 收集 Group By 字段的血缘，供聚合字段使用
+                groupingFieldLineages.add(lineage);
+                if (DEBUG_MODE) {
+                    System.out.println("    -> Added to groupingFieldLineages (total: " + groupingFieldLineages.size() + ")");
                 }
             }
+        }
+        if (DEBUG_MODE) {
+            System.out.println("Total groupingFieldLineages collected: " + groupingFieldLineages.size());
         }
 
         // 第二步：解析聚合表达式（如 COUNT(a) AS b）
@@ -1250,26 +1293,78 @@ public class LogicalPlanLineageParser {
      * 判断表达式是否包含聚合函数
      */
     private static boolean containsAggregateFunction(Expression expr) {
+        return containsAggregateFunction(expr, 0);
+    }
+
+    // 常见的SQL聚合函数名集合
+    private static final Set<String> AGGREGATE_FUNCTION_NAMES = new HashSet<>(Arrays.asList(
+            "count", "sum", "avg", "min", "max", "stddev", "variance",
+            "count_distinct", "approx_count_distinct",
+            "first", "last", "collect_list", "collect_set",
+            "array_agg", "string_agg", "bit_and", "bit_or", "bit_xor"
+    ));
+
+    private static boolean containsAggregateFunction(Expression expr, int depth) {
         if (expr == null) {
             return false;
         }
 
-        // 如果本身就是聚合函数，返回true
+        if (DEBUG_MODE && depth == 0) {
+            System.out.println("  Checking if expression contains aggregate: " + expr.getClass().getSimpleName());
+        }
+
+        // 1. 检查是否是已解析的聚合函数
         if (expr instanceof AggregateFunction) {
+            if (DEBUG_MODE && depth == 0) {
+                System.out.println("    -> IS an AggregateFunction: " + expr.getClass().getSimpleName());
+            }
             return true;
         }
 
-        // 递归检查子表达式
+        // 2. 检查是否是未解析的函数，通过函数名判断是否为聚合函数
+        if (expr instanceof UnresolvedFunction) {
+            // UnresolvedFunction 使用 toString() 来获取函数名
+            // 输出格式类似: 'count('o.order_id) 或 'sum('oi.goods_price * 'oi.goods_num)
+            String exprString = expr.toString();
+            // 提取函数名：去掉前面的单引号，然后取第一个单词
+            String functionName = exprString.replaceAll("^'+", "").toLowerCase();
+            int parenIndex = functionName.indexOf('(');
+            if (parenIndex > 0) {
+                functionName = functionName.substring(0, parenIndex);
+            }
+
+            // 处理 distinct 修饰符，如 count_distinct
+            if (functionName.contains("distinct")) {
+                functionName = "count_distinct";
+            }
+
+            boolean isAggregate = AGGREGATE_FUNCTION_NAMES.contains(functionName);
+            if (DEBUG_MODE && depth == 0) {
+                System.out.println("    -> UnresolvedFunction: " + exprString + ", extracted name: " + functionName + ", isAggregate: " + isAggregate);
+            }
+            if (isAggregate) {
+                return true;
+            }
+        }
+
+        // 3. 递归检查子表达式
         Seq<Expression> children = expr.children();
         if (children != null && !children.isEmpty()) {
             Iterator<Expression> it = children.iterator();
             while (it.hasNext()) {
-                if (containsAggregateFunction(it.next())) {
+                Expression child = it.next();
+                if (DEBUG_MODE && depth == 0) {
+                    System.out.println("    -> Checking child: " + child.getClass().getSimpleName());
+                }
+                if (containsAggregateFunction(child, depth + 1)) {
                     return true;
                 }
             }
         }
 
+        if (DEBUG_MODE && depth == 0) {
+            System.out.println("    -> NOT an aggregate expression");
+        }
         return false;
     }
 
@@ -1547,18 +1642,19 @@ public class LogicalPlanLineageParser {
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
         sql = "SELECT\n" +
+                "  CASE \n" +
+                "    WHEN SUM(oi.goods_price * oi.goods_num) >= 1000 THEN 'HIGH'\n" +
+                "    ELSE 'LOW'\n" +
+                "  END AS user_consume_level,  -- 条件计算字段\n" +
                 "  u.user_id,\n" +
-                "  u.user_name,\n" +
-                "  COUNT(DISTINCT o.order_id) AS user_order_count,  -- 聚合+去重\n" +
-                "  SUM(oi.goods_price * oi.goods_num) AS user_goods_total,  -- 计算+聚合\n" +
-                "  MAX(o.order_amount) AS max_single_order,  -- 聚合函数\n" +
-                "  MIN(o.pay_time) AS first_pay_time,  -- 时间类聚合\n" +
-                "  u.nonexistent_user_phone AS null_field  -- 不存在字段\n" +
+                "  u.register_time,\n" +
+                "  COUNT(o.order_id) AS total_orders,\n" +
+                "  AVG(o.order_amount) AS avg_order_amount,  -- 平均值聚合\n" +
+                "  o.nonexistent_order_type AS invalid_field  -- 不存在字段\n" +
                 "FROM default.t_user u\n" +
                 "LEFT JOIN default.t_order o ON u.user_id = o.user_id\n" +
                 "LEFT JOIN default.t_order_item oi ON o.order_id = oi.order_id\n" +
-                "WHERE o.order_status = 'PAID'\n" +
-                "GROUP BY u.user_id, u.user_name;";
+                "GROUP BY u.user_id, u.register_time;";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
@@ -1567,11 +1663,11 @@ public class LogicalPlanLineageParser {
                 // ========== 新增：显式绑定远程Hive Metastore地址（核心） ==========
                 .config("hive.metastore.uris", "thrift://115.191.22.177:9083")
                 // ========== 原有辅助配置保留 ==========
-//                .config("spark.sql.optimizer.enabled", "false")
-//                .config("spark.sql.autoBroadcastJoinThreshold", "-1")
-//                .config("spark.sql.adaptive.enabled", "false")
-//                .config("spark.hadoop.fs.defaultFS", "hdfs://115.191.22.177:8020")
-//                .config("spark.sql.warehouse.dir", "/user/hive/warehouse")
+                .config("spark.sql.optimizer.enabled", "false")
+                .config("spark.sql.autoBroadcastJoinThreshold", "-1")
+                .config("spark.sql.adaptive.enabled", "false")
+                .config("spark.hadoop.fs.defaultFS", "hdfs://115.191.22.177:8020")
+                .config("spark.sql.warehouse.dir", "/user/hive/warehouse")
                 .config("hive.metastore.client.socket.timeout", "300000")
                 .config("log4j.logger.org.apache.hive", "ERROR")
                 .config("log4j.logger.org.apache.hadoop", "ERROR")
