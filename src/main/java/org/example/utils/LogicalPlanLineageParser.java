@@ -1534,6 +1534,10 @@ public class LogicalPlanLineageParser {
                 deps.add(name);
             }
         }
+        // 处理 CaseWhen 表达式（需要特殊处理分支结构）
+        else if (isCaseWhenExpression(expr)) {
+            deps.addAll(extractCaseWhenDependencies((CaseWhen) expr));
+        }
         // 递归处理子表达式
         else {
             Seq<Expression> children = expr.children();
@@ -1546,6 +1550,90 @@ public class LogicalPlanLineageParser {
         }
 
         return deps;
+    }
+
+    /**
+     * 专门处理 CaseWhen 表达式的依赖提取
+     * 例如：CASE WHEN SUM(oi.goods_price * oi.goods_num) >= 2000 THEN 'VIP' ... END AS user_level
+     *
+     * @param caseExpr CaseWhen 表达式
+     * @return CaseWhen 表达式中依赖的所有字段名（带表别名）
+     */
+    private static Set<String> extractCaseWhenDependencies(CaseWhen caseExpr) {
+        Set<String> deps = new HashSet<>();
+        if (caseExpr == null) {
+            return deps;
+        }
+
+        if (DEBUG_MODE) {
+            System.out.println("  >>> Extracting CaseWhen dependencies <<<");
+            System.out.println("  CaseWhen branches count: " + caseExpr.branches().size());
+        }
+
+        // 获取所有分支：每个分支是 Tuple2<predicate, value>
+        scala.collection.Seq<scala.Tuple2<org.apache.spark.sql.catalyst.expressions.Expression, org.apache.spark.sql.catalyst.expressions.Expression>> branches = caseExpr.branches();
+        scala.collection.Iterator<scala.Tuple2<org.apache.spark.sql.catalyst.expressions.Expression, org.apache.spark.sql.catalyst.expressions.Expression>> branchesIter = branches.iterator();
+
+        int branchIndex = 0;
+        while (branchesIter.hasNext()) {
+            scala.Tuple2<org.apache.spark.sql.catalyst.expressions.Expression, org.apache.spark.sql.catalyst.expressions.Expression> branch = branchesIter.next();
+            branchIndex++;
+
+            // 第一个元素是 predicate（WHEN 条件）
+            org.apache.spark.sql.catalyst.expressions.Expression predicate = branch._1();
+            if (predicate != null) {
+                if (DEBUG_MODE) {
+                    System.out.println("    Branch " + branchIndex + " predicate: " + predicate.getClass().getSimpleName() + " - " + predicate);
+                }
+                // 递归提取 predicate 中的依赖
+                deps.addAll(extractDependencies(predicate));
+            }
+
+            // 第二个元素是 value（THEN 结果）
+            org.apache.spark.sql.catalyst.expressions.Expression value = branch._2();
+            if (value != null) {
+                if (DEBUG_MODE) {
+                    System.out.println("    Branch " + branchIndex + " value: " + value.getClass().getSimpleName() + " - " + value);
+                }
+                // 如果 value 不是 Literal（常量），提取其依赖
+                if (!(value instanceof Literal)) {
+                    deps.addAll(extractDependencies(value));
+                }
+            }
+        }
+
+        // 处理 ELSE 分支
+        scala.Option<org.apache.spark.sql.catalyst.expressions.Expression> elseValueOpt = caseExpr.elseValue();
+        if (elseValueOpt.isDefined()) {
+            org.apache.spark.sql.catalyst.expressions.Expression elseValue = elseValueOpt.get();
+            if (DEBUG_MODE) {
+                System.out.println("    ELSE value: " + elseValue.getClass().getSimpleName() + " - " + elseValue);
+            }
+            // 如果 ELSE 值不是 Literal（常量），提取其依赖
+            if (!(elseValue instanceof Literal)) {
+                deps.addAll(extractDependencies(elseValue));
+            }
+        } else {
+            if (DEBUG_MODE) {
+                System.out.println("    ELSE value: None (no ELSE clause)");
+            }
+        }
+
+        if (DEBUG_MODE) {
+            System.out.println("  <<< CaseWhen dependencies extracted: " + deps + " >>>");
+        }
+
+        return deps;
+    }
+
+    /**
+     * 判断字段类型是否为 CaseWhen 表达式
+     *
+     * @param expr 表达式
+     * @return 如果是 CaseWhen 表达式返回 true，否则返回 false
+     */
+    private static boolean isCaseWhenExpression(Expression expr) {
+        return expr instanceof CaseWhen;
     }
 
     //todo 重大问题
