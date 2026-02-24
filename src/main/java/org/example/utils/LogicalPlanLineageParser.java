@@ -544,7 +544,6 @@ public class LogicalPlanLineageParser {
 
         return result;
     }
-
     private static Map<String, FieldLineage> parseAggregate(Aggregate plan, Map<String, Map<String, FieldLineage>> cteCache) {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
 
@@ -585,7 +584,21 @@ public class LogicalPlanLineageParser {
                     if (DEBUG_MODE) {
                         System.out.println("    -> NamedExpression, name = " + fieldName);
                     }
-                } else {
+                }
+                else if (expr instanceof Cast) {
+                    fieldName = handleCastExpressionInGroupBy((Cast) expr, childFields, cteCache);
+                    if (fieldName == null) {
+                        if (DEBUG_MODE) {
+                            System.out.println("    -> Skipping (Cast expression handler returned null)");
+                        }
+                        continue;
+                    }
+                    if (DEBUG_MODE) {
+                        System.out.println("    -> Cast expression, name = " + fieldName);
+                    }
+                }
+
+                else {
                     // 其他类型（如表达式），跳过
                     if (DEBUG_MODE) {
                         System.out.println("    -> Skipping (not AttributeReference or NamedExpression)");
@@ -1183,6 +1196,133 @@ public class LogicalPlanLineageParser {
         return new HashMap<>();
     }
 
+
+    /**
+     * 处理 GROUP BY 中的 CAST 表达式
+     * 例如：GROUP BY CAST(user_id AS STRING)
+     *
+     * @param castExpr Cast 表达式
+     * @param childFields 子节点的字段血缘
+     * @param cteCache CTE 缓存
+     * @return Cast 后的字段名，如果无法处理则返回 null
+     */
+    private static String handleCastExpressionInGroupBy(Cast castExpr, Map<String, FieldLineage> childFields, Map<String, Map<String, FieldLineage>> cteCache) {
+        if (castExpr == null) {
+            return null;
+        }
+
+        // 获取 Cast 内部的子表达式
+        Expression child = castExpr.child();
+        if (child == null) {
+            return null;
+        }
+
+        // 获取数据类型（用于生成字段名）
+        String dataType;
+        try {
+            dataType = castExpr.dataType().sql();
+        } catch (Exception e) {
+            dataType = castExpr.dataType().toString();
+        }
+
+        if (DEBUG_MODE) {
+            System.out.println("      >>> Cast Expression Debug <<<");
+            System.out.println("      Child type: " + child.getClass().getSimpleName());
+            System.out.println("      Child expression: " + child);
+            System.out.println("      Target data type: " + dataType);
+        }
+
+        // 根据子表达式类型生成字段名
+        String baseFieldName;
+
+        // 1. 如果子表达式是 AttributeReference（直接字段引用）
+        if (child instanceof AttributeReference) {
+            AttributeReference attrRef = (AttributeReference) child;
+            baseFieldName = attrRef.name();
+
+            if (DEBUG_MODE) {
+                System.out.println("      AttributeReference name: " + baseFieldName);
+            }
+
+            // 生成 Cast 后的字段名：格式为 "cast_{字段名}_as_{类型}"
+            return "cast_" + baseFieldName + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+        }
+
+        // 2. 如果子表达式是 UnresolvedAttribute（未解析的字段引用）
+        else if (child instanceof UnresolvedAttribute) {
+            UnresolvedAttribute unresolvedAttr = (UnresolvedAttribute) child;
+            baseFieldName = unresolvedAttr.name();
+
+            if (DEBUG_MODE) {
+                System.out.println("      UnresolvedAttribute name: " + baseFieldName);
+            }
+
+            // 生成 Cast 后的字段名
+            return "cast_" + baseFieldName.replaceAll("[^a-zA-Z0-9_]", "_") + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+        }
+
+        // 3. 如果子表达式是 Alias（带别名的表达式）
+        else if (child instanceof Alias) {
+            Alias alias = (Alias) child;
+            baseFieldName = alias.name();
+
+            if (DEBUG_MODE) {
+                System.out.println("      Alias name: " + baseFieldName);
+                System.out.println("      Alias child: " + alias.child());
+            }
+
+            // 生成 Cast 后的字段名
+            return "cast_" + baseFieldName + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+        }
+
+        // 4. 如果子表达式是另一个 Cast（嵌套 Cast）
+        else if (child instanceof Cast) {
+            String innerCastName = handleCastExpressionInGroupBy((Cast) child, childFields, cteCache);
+            if (innerCastName != null) {
+                return innerCastName + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+            }
+        }
+
+        // 5. 对于其他类型的表达式（函数调用、算术表达式等）
+        else {
+            // 尝试提取依赖字段并生成一个描述性的字段名
+            Set<String> depNames = extractDependencies(child);
+
+            if (DEBUG_MODE) {
+                System.out.println("      Complex expression, dependencies: " + depNames);
+            }
+
+            if (!depNames.isEmpty()) {
+                // 使用依赖字段生成字段名
+                String depsStr = String.join("_", depNames).replaceAll("[^a-zA-Z0-9_]", "_");
+                return "cast_expr_" + depsStr + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+            } else {
+                // 使用表达式 SQL 生成字段名
+                String exprSql;
+                try {
+                    exprSql = child.sql();
+                } catch (Exception e) {
+                    exprSql = child.toString();
+                }
+                // 清理 SQL 字符串，移除不安全字符
+                String cleanSql = exprSql.replaceAll("[^a-zA-Z0-9_]", "_").replaceAll("_+", "_");
+                // 限制长度避免字段名过长
+                if (cleanSql.length() > 30) {
+                    cleanSql = cleanSql.substring(0, 30);
+                }
+                return "cast_" + cleanSql + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
+            }
+        }
+
+        // 无法处理的情况
+        if (DEBUG_MODE) {
+            System.out.println("      WARNING: Unable to generate field name for Cast expression");
+        }
+        return null;
+    }
+
+
+
     /**
      * 解析 ShowPartitionsCommand
      * SHOW PARTITIONS table_name
@@ -1379,7 +1519,13 @@ public class LogicalPlanLineageParser {
 
         // 处理已解析的属性引用
         if (expr instanceof AttributeReference) {
-            deps.add(((AttributeReference) expr).name());
+            Seq<String> qualifier = ((AttributeReference) expr).qualifier();
+            if (qualifier != null&& !qualifier.isEmpty()) {
+                deps.add(qualifier.head()+"."+((AttributeReference) expr).name());
+            }
+            else {
+                deps.add(((AttributeReference) expr).name());
+            }
         }
         // 处理未解析的属性引用（带前缀的字段，如 rnk.uid）
         else if (expr instanceof UnresolvedAttribute) {
@@ -1641,20 +1787,20 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "SELECT\n" +
-                "  CASE \n" +
+        sql = "-- SQL19：多层CASE WHEN+IFNULL，测试条件字段血缘\n" +
+                "SELECT\n" +
+                "  u.user_id,\n" +
+                "  CASE\n" +
+                "    WHEN SUM(oi.goods_price * oi.goods_num) >= 2000 THEN 'VIP'\n" +
                 "    WHEN SUM(oi.goods_price * oi.goods_num) >= 1000 THEN 'HIGH'\n" +
                 "    ELSE 'LOW'\n" +
-                "  END AS user_consume_level,  -- 条件计算字段\n" +
-                "  u.user_id,\n" +
-                "  u.register_time,\n" +
-                "  COUNT(o.order_id) AS total_orders,\n" +
-                "  AVG(o.order_amount) AS avg_order_amount,  -- 平均值聚合\n" +
-                "  o.nonexistent_order_type AS invalid_field  -- 不存在字段\n" +
+                "  END AS user_level,\n" +
+                "  IFNULL(o.pay_time, o.create_time) AS effective_pay_time,  -- NULL兜底\n" +
+                "  CASE WHEN o.order_status = 'REFUNDED' THEN -o.order_amount ELSE o.order_amount END AS actual_amount\n" +
                 "FROM default.t_user u\n" +
                 "LEFT JOIN default.t_order o ON u.user_id = o.user_id\n" +
                 "LEFT JOIN default.t_order_item oi ON o.order_id = oi.order_id\n" +
-                "GROUP BY u.user_id, u.register_time;";
+                "GROUP BY u.user_id, o.pay_time, o.create_time, o.order_status, o.order_amount;";
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
