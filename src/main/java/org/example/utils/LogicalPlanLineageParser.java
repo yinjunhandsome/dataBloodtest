@@ -1,5 +1,6 @@
 package org.example.utils;
 
+import com.bj58.dpd.dp.util.ExpUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.analysis.*;
@@ -21,7 +22,6 @@ import scala.collection.Iterator;
 import scala.collection.Seq;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Spark LogicalPlan 字段级血缘解析器
@@ -44,8 +44,6 @@ public class LogicalPlanLineageParser {
 
     // ==================== 调试开关 ====================
     // 设为false关闭所有调试输出，设为true开启详细日志
-    private static final boolean DEBUG_MODE = true;
-
 
     /**
      * 解析入口：解析LogicalPlan生成字段级血缘
@@ -438,10 +436,7 @@ public class LogicalPlanLineageParser {
                 } catch (Exception e) {
                     // 未解析的表达式，检查是否为 Star (*)
                     String exprClassName = expr.getClass().getSimpleName();
-                    System.out.println("      Expression error: " + e.getMessage() + ", class: " + exprClassName);
-
                     if (exprClassName.equals("Star") || exprClassName.equals("UnresolvedStar")) {
-                        System.out.println("      Expanding " + exprClassName + " (*) - adding all " + childFields.size() + " child fields");
                         // Star 展开：添加所有子字段
                         for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
                             FieldLineage cloned = cloneFieldLineage(entry.getValue());
@@ -478,20 +473,10 @@ public class LogicalPlanLineageParser {
 
                     // 提取别名字段的依赖
                     Set<String> depNames = extractDependencies(alias.child());
-                    if (DEBUG_MODE && !depNames.isEmpty()) {
-                        System.out.println("      Field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
-                    }
                     for (String depName : depNames) {
                         FieldLineage dep = findFieldInChildFields(depName, childFields);
                         if (dep != null) {
                             lineage.addDependency(cloneFieldLineage(dep));
-                            if (DEBUG_MODE) {
-                                System.out.println("        Added dependency: " + depName + " (total dependencies: " + lineage.getDependencies().size() + ")");
-                            }
-                        } else {
-                            if (DEBUG_MODE) {
-                                System.out.println("        WARNING: Cannot find dependency '" + depName + "' in childFields");
-                            }
                         }
                     }
 
@@ -547,70 +532,36 @@ public class LogicalPlanLineageParser {
     private static Map<String, FieldLineage> parseAggregate(Aggregate plan, Map<String, Map<String, FieldLineage>> cteCache) {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
 
-        if (DEBUG_MODE) {
-            System.out.println("===== DEBUG: parseAggregate - childFields =====");
-            System.out.println("Number of childFields: " + childFields.size());
-            for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
-                System.out.println("  " + entry.getKey() + " -> " + entry.getValue().getSourceTableName());
-            }
-        }
-
         Map<String, FieldLineage> result = new HashMap<>();
 
         // 第一步：解析 Group By 字段，并收集它们的血缘信息供后续聚合字段使用
         List<FieldLineage> groupingFieldLineages = new ArrayList<>();
         Seq<Expression> groupingExprs = plan.groupingExpressions();
-        if (DEBUG_MODE) {
-            System.out.println("===== DEBUG: parseAggregate - GROUP BY expressions =====");
-            System.out.println("Number of GROUP BY expressions: " + (groupingExprs != null ? groupingExprs.size() : 0));
-        }
         if (groupingExprs != null && !groupingExprs.isEmpty()) {
             Iterator<Expression> it = groupingExprs.iterator();
             while (it.hasNext()) {
                 Expression expr = it.next();
-                if (DEBUG_MODE) {
-                    System.out.println("  GROUP BY expression: " + expr.getClass().getSimpleName() + " - " + expr);
-                }
-
                 // 获取字段名：支持 AttributeReference 和 NamedExpression
                 String fieldName;
                 if (expr instanceof AttributeReference) {
                     fieldName = ((AttributeReference) expr).name();
-                    if (DEBUG_MODE) {
-                        System.out.println("    -> AttributeReference, name = " + fieldName);
-                    }
                 } else if (expr instanceof NamedExpression) {
                     fieldName = ((NamedExpression) expr).name();
-                    if (DEBUG_MODE) {
-                        System.out.println("    -> NamedExpression, name = " + fieldName);
-                    }
                 }
                 else if (expr instanceof Cast) {
                     fieldName = handleCastExpressionInGroupBy((Cast) expr, childFields, cteCache);
                     if (fieldName == null) {
-                        if (DEBUG_MODE) {
-                            System.out.println("    -> Skipping (Cast expression handler returned null)");
-                        }
                         continue;
-                    }
-                    if (DEBUG_MODE) {
-                        System.out.println("    -> Cast expression, name = " + fieldName);
                     }
                 }
 
                 else {
                     // 其他类型（如表达式），跳过
-                    if (DEBUG_MODE) {
-                        System.out.println("    -> Skipping (not AttributeReference or NamedExpression)");
-                    }
                     continue;
                 }
 
                 FieldLineage lineage = new FieldLineage(fieldName, "AGGREGATE");
                 Set<String> depNames = extractDependencies(expr);
-                if (DEBUG_MODE) {
-                    System.out.println("    -> Extracted dependencies: " + depNames);
-                }
                 for (String depName : depNames) {
                     FieldLineage dep = findFieldInChildFields(depName, childFields);
                     if (dep != null) {
@@ -621,13 +572,7 @@ public class LogicalPlanLineageParser {
                 }
                 // 收集 Group By 字段的血缘，供聚合字段使用
                 groupingFieldLineages.add(lineage);
-                if (DEBUG_MODE) {
-                    System.out.println("    -> Added to groupingFieldLineages (total: " + groupingFieldLineages.size() + ")");
-                }
             }
-        }
-        if (DEBUG_MODE) {
-            System.out.println("Total groupingFieldLineages collected: " + groupingFieldLineages.size());
         }
 
         // 第二步：解析聚合表达式（如 COUNT(a) AS b）
@@ -660,16 +605,10 @@ public class LogicalPlanLineageParser {
 
                     // 1. 先添加聚合函数内部字段的依赖
                     Set<String> depNames = extractDependencies((Expression) expr);
-                    if (DEBUG_MODE && !depNames.isEmpty()) {
-                        System.out.println("    Aggregate field '" + fieldName + "' has " + depNames.size() + " expression dependencies: " + depNames);
-                    }
                     for (String depName : depNames) {
                         FieldLineage dep = findFieldInChildFields(depName, childFields);
                         if (dep != null) {
                             lineage.addDependency(cloneFieldLineage(dep));
-                            if (DEBUG_MODE) {
-                                System.out.println("      Added expression dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
-                            }
                         } else {
                             System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for aggregate field " + fieldName);
                         }
@@ -678,20 +617,10 @@ public class LogicalPlanLineageParser {
                     // 2. 添加所有 Group By 字段作为依赖
                     // 因为聚合字段是在每个分组内计算的，依赖于分组键
                     if (!groupingFieldLineages.isEmpty()) {
-                        if (DEBUG_MODE) {
-                            System.out.println("    Adding " + groupingFieldLineages.size() + " grouping field dependencies to aggregate field '" + fieldName + "'");
-                        }
                         for (FieldLineage groupingLineage : groupingFieldLineages) {
                             // 克隆 Group By 字段的血缘作为聚合字段的依赖
                             lineage.addDependency(cloneFieldLineage(groupingLineage));
-                            if (DEBUG_MODE) {
-                                System.out.println("      Added grouping dependency: " + groupingLineage.getFieldName() + " (total: " + lineage.getDependencies().size() + ")");
-                            }
                         }
-                    }
-
-                    if (DEBUG_MODE) {
-                        System.out.println("    Aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
                     }
                 } else {
                     // === 非聚合字段（直接SELECT的Group By字段，如 user_id） ===
@@ -700,23 +629,13 @@ public class LogicalPlanLineageParser {
 
                     // 只提取字段自身的依赖
                     Set<String> depNames = extractDependencies((Expression) expr);
-                    if (DEBUG_MODE && !depNames.isEmpty()) {
-                        System.out.println("    Non-aggregate field '" + fieldName + "' has " + depNames.size() + " dependencies: " + depNames);
-                    }
                     for (String depName : depNames) {
                         FieldLineage dep = findFieldInChildFields(depName, childFields);
                         if (dep != null) {
                             lineage.addDependency(cloneFieldLineage(dep));
-                            if (DEBUG_MODE) {
-                                System.out.println("      Added dependency: " + depName + " (total: " + lineage.getDependencies().size() + ")");
-                            }
                         } else {
                             System.out.println("    WARNING: Cannot find dependency '" + depName + "' in childFields for field " + fieldName);
                         }
-                    }
-
-                    if (DEBUG_MODE) {
-                        System.out.println("    Non-aggregate field '" + fieldName + "' final dependencies count: " + lineage.getDependencies().size());
                     }
                 }
 
@@ -1225,13 +1144,6 @@ public class LogicalPlanLineageParser {
             dataType = castExpr.dataType().toString();
         }
 
-        if (DEBUG_MODE) {
-            System.out.println("      >>> Cast Expression Debug <<<");
-            System.out.println("      Child type: " + child.getClass().getSimpleName());
-            System.out.println("      Child expression: " + child);
-            System.out.println("      Target data type: " + dataType);
-        }
-
         // 根据子表达式类型生成字段名
         String baseFieldName;
 
@@ -1239,11 +1151,6 @@ public class LogicalPlanLineageParser {
         if (child instanceof AttributeReference) {
             AttributeReference attrRef = (AttributeReference) child;
             baseFieldName = attrRef.name();
-
-            if (DEBUG_MODE) {
-                System.out.println("      AttributeReference name: " + baseFieldName);
-            }
-
             // 生成 Cast 后的字段名：格式为 "cast_{字段名}_as_{类型}"
             return "cast_" + baseFieldName + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
         }
@@ -1253,10 +1160,6 @@ public class LogicalPlanLineageParser {
             UnresolvedAttribute unresolvedAttr = (UnresolvedAttribute) child;
             baseFieldName = unresolvedAttr.name();
 
-            if (DEBUG_MODE) {
-                System.out.println("      UnresolvedAttribute name: " + baseFieldName);
-            }
-
             // 生成 Cast 后的字段名
             return "cast_" + baseFieldName.replaceAll("[^a-zA-Z0-9_]", "_") + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
         }
@@ -1265,11 +1168,6 @@ public class LogicalPlanLineageParser {
         else if (child instanceof Alias) {
             Alias alias = (Alias) child;
             baseFieldName = alias.name();
-
-            if (DEBUG_MODE) {
-                System.out.println("      Alias name: " + baseFieldName);
-                System.out.println("      Alias child: " + alias.child());
-            }
 
             // 生成 Cast 后的字段名
             return "cast_" + baseFieldName + "_as_" + dataType.toLowerCase().replaceAll("[^a-z0-9]", "_");
@@ -1287,10 +1185,6 @@ public class LogicalPlanLineageParser {
         else {
             // 尝试提取依赖字段并生成一个描述性的字段名
             Set<String> depNames = extractDependencies(child);
-
-            if (DEBUG_MODE) {
-                System.out.println("      Complex expression, dependencies: " + depNames);
-            }
 
             if (!depNames.isEmpty()) {
                 // 使用依赖字段生成字段名
@@ -1315,9 +1209,6 @@ public class LogicalPlanLineageParser {
         }
 
         // 无法处理的情况
-        if (DEBUG_MODE) {
-            System.out.println("      WARNING: Unable to generate field name for Cast expression");
-        }
         return null;
     }
 
@@ -1449,15 +1340,8 @@ public class LogicalPlanLineageParser {
             return false;
         }
 
-        if (DEBUG_MODE && depth == 0) {
-            System.out.println("  Checking if expression contains aggregate: " + expr.getClass().getSimpleName());
-        }
-
         // 1. 检查是否是已解析的聚合函数
         if (expr instanceof AggregateFunction) {
-            if (DEBUG_MODE && depth == 0) {
-                System.out.println("    -> IS an AggregateFunction: " + expr.getClass().getSimpleName());
-            }
             return true;
         }
 
@@ -1479,9 +1363,6 @@ public class LogicalPlanLineageParser {
             }
 
             boolean isAggregate = AGGREGATE_FUNCTION_NAMES.contains(functionName);
-            if (DEBUG_MODE && depth == 0) {
-                System.out.println("    -> UnresolvedFunction: " + exprString + ", extracted name: " + functionName + ", isAggregate: " + isAggregate);
-            }
             if (isAggregate) {
                 return true;
             }
@@ -1493,17 +1374,10 @@ public class LogicalPlanLineageParser {
             Iterator<Expression> it = children.iterator();
             while (it.hasNext()) {
                 Expression child = it.next();
-                if (DEBUG_MODE && depth == 0) {
-                    System.out.println("    -> Checking child: " + child.getClass().getSimpleName());
-                }
                 if (containsAggregateFunction(child, depth + 1)) {
                     return true;
                 }
             }
-        }
-
-        if (DEBUG_MODE && depth == 0) {
-            System.out.println("    -> NOT an aggregate expression");
         }
         return false;
     }
@@ -1565,11 +1439,6 @@ public class LogicalPlanLineageParser {
             return deps;
         }
 
-        if (DEBUG_MODE) {
-            System.out.println("  >>> Extracting CaseWhen dependencies <<<");
-            System.out.println("  CaseWhen branches count: " + caseExpr.branches().size());
-        }
-
         // 获取所有分支：每个分支是 Tuple2<predicate, value>
         scala.collection.Seq<scala.Tuple2<org.apache.spark.sql.catalyst.expressions.Expression, org.apache.spark.sql.catalyst.expressions.Expression>> branches = caseExpr.branches();
         scala.collection.Iterator<scala.Tuple2<org.apache.spark.sql.catalyst.expressions.Expression, org.apache.spark.sql.catalyst.expressions.Expression>> branchesIter = branches.iterator();
@@ -1582,9 +1451,6 @@ public class LogicalPlanLineageParser {
             // 第一个元素是 predicate（WHEN 条件）
             org.apache.spark.sql.catalyst.expressions.Expression predicate = branch._1();
             if (predicate != null) {
-                if (DEBUG_MODE) {
-                    System.out.println("    Branch " + branchIndex + " predicate: " + predicate.getClass().getSimpleName() + " - " + predicate);
-                }
                 // 递归提取 predicate 中的依赖
                 deps.addAll(extractDependencies(predicate));
             }
@@ -1592,9 +1458,6 @@ public class LogicalPlanLineageParser {
             // 第二个元素是 value（THEN 结果）
             org.apache.spark.sql.catalyst.expressions.Expression value = branch._2();
             if (value != null) {
-                if (DEBUG_MODE) {
-                    System.out.println("    Branch " + branchIndex + " value: " + value.getClass().getSimpleName() + " - " + value);
-                }
                 // 如果 value 不是 Literal（常量），提取其依赖
                 if (!(value instanceof Literal)) {
                     deps.addAll(extractDependencies(value));
@@ -1606,21 +1469,10 @@ public class LogicalPlanLineageParser {
         scala.Option<org.apache.spark.sql.catalyst.expressions.Expression> elseValueOpt = caseExpr.elseValue();
         if (elseValueOpt.isDefined()) {
             org.apache.spark.sql.catalyst.expressions.Expression elseValue = elseValueOpt.get();
-            if (DEBUG_MODE) {
-                System.out.println("    ELSE value: " + elseValue.getClass().getSimpleName() + " - " + elseValue);
-            }
             // 如果 ELSE 值不是 Literal（常量），提取其依赖
             if (!(elseValue instanceof Literal)) {
                 deps.addAll(extractDependencies(elseValue));
             }
-        } else {
-            if (DEBUG_MODE) {
-                System.out.println("    ELSE value: None (no ELSE clause)");
-            }
-        }
-
-        if (DEBUG_MODE) {
-            System.out.println("  <<< CaseWhen dependencies extracted: " + deps + " >>>");
         }
 
         return deps;
@@ -1875,33 +1727,120 @@ public class LogicalPlanLineageParser {
                 "    nonexistent_order_field\n" +
                 "FROM user_order_detail\n" +
                 "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "-- SQL19：多层CASE WHEN+IFNULL，测试条件字段血缘\n" +
-                "SELECT\n" +
-                "  u.user_id,\n" +
-                "  CASE\n" +
-                "    WHEN SUM(oi.goods_price * oi.goods_num) >= 2000 THEN 'VIP'\n" +
-                "    WHEN SUM(oi.goods_price * oi.goods_num) >= 1000 THEN 'HIGH'\n" +
-                "    ELSE 'LOW'\n" +
-                "  END AS user_level,\n" +
-                "  IFNULL(o.pay_time, o.create_time) AS effective_pay_time,  -- NULL兜底\n" +
-                "  CASE WHEN o.order_status = 'REFUNDED' THEN -o.order_amount ELSE o.order_amount END AS actual_amount\n" +
-                "FROM default.t_user u\n" +
-                "LEFT JOIN default.t_order o ON u.user_id = o.user_id\n" +
-                "LEFT JOIN default.t_order_item oi ON o.order_id = oi.order_id\n" +
-                "GROUP BY u.user_id, o.pay_time, o.create_time, o.order_status, o.order_amount;";
+        sql = "\n" +
+                "\n" +
+                "\n" +
+                "insert OVERWRITE table  hdp_ubu_zhuanzhuan_ads_media.ads_order_period_analysis_full_1d\n" +
+                "PARTITION(dt='${outFileSuffix}') \n" +
+                "\n" +
+                "select \n" +
+                "substr(pay_time,1,4) as pay_year\n" +
+                ",substr(pay_time,1,10) as pay_date\n" +
+                ",period_v1\n" +
+                ",period\n" +
+                ",amount_range\n" +
+                "--,brand_type\n" +
+                ",count(distinct order_id) as order_cnt\n" +
+                ",sum(total_amt) as gmv\n" +
+                "from (\n" +
+                "select \n" +
+                "order_id\n" +
+                ",t1.brand_name\n" +
+                ",t1.model_name\n" +
+                ",case \n" +
+                "    when t2.amoeba_unit='折叠屏' then '折叠屏' \n" +
+                "    when t1.brand_name in ('苹果','华为','小米','OPPO','vivo','IQOO','红米','realme','荣耀','三星','一加') then t1.brand_name\n" +
+                "    else '其他'\n" +
+                "end as brand_type\n" +
+                ",total_amt/100 as total_amt\n" +
+                ",case \n" +
+                "    when total_amt/100 <= 500 then '0-500'\n" +
+                "    when total_amt/100 <= 1000 then '500-1000'\n" +
+                "    when total_amt/100 <= 1500 then '1000-1500'\n" +
+                "    when total_amt/100 <= 2000 then '1500-2000'\n" +
+                "    when total_amt/100 <= 2500 then '2000-2500'\n" +
+                "    when total_amt/100 <= 3000 then '2500-3000'\n" +
+                "    when total_amt/100 <= 3500 then '3000-3500'\n" +
+                "    when total_amt/100 <= 4000 then '3500-4000'\n" +
+                "    when total_amt/100 <= 4500 then '4000-4500'\n" +
+                "    when total_amt/100 <= 5000 then '4500-5000'\n" +
+                "    when total_amt/100 <= 5500 then '5000-5500'\n" +
+                "    when total_amt/100 <= 6000 then '5500-6000'\n" +
+                "    else '6000+'\n" +
+                "end as amount_range\n" +
+                ",case \n" +
+                "    when substr(pay_time,1,7) in ('2024-07','2024-08') then '24年暑假'\n" +
+                "    when substr(pay_time,1,7) in ('2025-07','2025-08') then '25年暑假'\n" +
+                "    when substr(pay_time,1,7) = '2024-06' then '24年6月'\n" +
+                "    when substr(pay_time,1,7) = '2025-06' then '25年6月'\n" +
+                "    when date(pay_time) between '2026-02-17' and '2026-02-23' then '26年氢弹'\n" +
+                "    when date(pay_time) between '2025-01-29' and '2025-02-04' then '25年氢弹'\n" +
+                "    when substr(pay_time,1,7) = '2026-01' then '26年1月'\n" +
+                "    when substr(pay_time,1,7) = '2024-12' then '24年12月'\n" +
+                "    else '其他'\n" +
+                "end as period\n" +
+                ",case \n" +
+                "    when substr(pay_time,1,7) in ('2024-07','2024-08') then '暑假'\n" +
+                "    when substr(pay_time,1,7) in ('2025-07','2025-08') then '暑假'\n" +
+                "    when substr(pay_time,1,7) = '2024-06' then '6月'\n" +
+                "    when substr(pay_time,1,7) = '2025-06' then '6月'\n" +
+                "    when date(pay_time) between '2026-02-17' and '2026-02-23' then '氢弹'\n" +
+                "    when date(pay_time) between '2025-01-29' and '2025-02-04' then '氢弹'\n" +
+                "    when substr(pay_time,1,7) = '2026-01' then '氢弹前1个月'\n" +
+                "    when substr(pay_time,1,7) = '2024-12' then '氢弹前1个月'\n" +
+                "    else '其他'\n" +
+                "end as period_v1\n" +
+                ",nvl(t2.amoeba_unit,'未知') as amoeba_unit\n" +
+                ",t1.pay_time\n" +
+                "from hdp_ubu_zhuanzhuan_dw_b2c.dw_trade_order_ord_all_subject_dtl_full_1d t1 \n" +
+                "left join hdp_zhuanzhuan_dim_global.dim_b2c_amobarole_model_0p t2 \n" +
+                "on t1.model_id=t2.model_id  \n" +
+                "where dt=date_sub(current_date,1)\n" +
+                "and cate_first_id=101\n" +
+                "and is_exchange_order_flag=0\n" +
+                "and is_pure_pay_the_day=1\n" +
+                "--and company_flag=1\n" +
+                "and (\n" +
+                "    -- 24年暑假：7-8月\n" +
+                "    substr(pay_time,1,7) in ('2024-07','2024-08')\n" +
+                "    -- 25年暑假：7-8月\n" +
+                "    or substr(pay_time,1,7) in ('2025-07','2025-08')\n" +
+                "    -- 24年6月\n" +
+                "    or substr(pay_time,1,7) = '2024-06'\n" +
+                "    -- 25年6月\n" +
+                "    or substr(pay_time,1,7) = '2025-06'\n" +
+                "    -- 26年氢弹：02.17-02.23\n" +
+                "    or (date(pay_time) between '2026-02-17' and '2026-02-23')\n" +
+                "    -- 25年氢弹：1.29-02.04\n" +
+                "    or (date(pay_time) between '2025-01-29' and '2025-02-04')\n" +
+                "    -- 26年1月\n" +
+                "    or substr(pay_time,1,7) = '2026-01'\n" +
+                "    -- 24年12月\n" +
+                "    or substr(pay_time,1,7) = '2024-12'\n" +
+                ")\n" +
+                ") t \n" +
+                "group by \n" +
+                "substr(pay_time,1,4)\n" +
+                "    ,substr(pay_time,1,10)\n" +
+                "    ,period_v1\n" +
+                "    ,period\n" +
+                "    ,amount_range\n" +
+                "   -- ,brand_type \n";
+        String new_sql= ExpUtils.replace(sql);
+        System.out.println(new_sql);
 
         SparkSession spark = SparkSession.builder()
                 .appName("LocalHiveLineageParser")
                 .master("local[*]")
                 .enableHiveSupport()
                 // ========== 新增：显式绑定远程Hive Metastore地址（核心） ==========
-                .config("hive.metastore.uris", "thrift://115.191.22.177:9083")
+                .config("hive.metastore.uris", "thrift://hdp-metastore-etl.58dns.org:9083")
                 // ========== 原有辅助配置保留 ==========
                 .config("spark.sql.optimizer.enabled", "false")
                 .config("spark.sql.autoBroadcastJoinThreshold", "-1")
                 .config("spark.sql.adaptive.enabled", "false")
-                .config("spark.hadoop.fs.defaultFS", "hdfs://115.191.22.177:8020")
-                .config("spark.sql.warehouse.dir", "/user/hive/warehouse")
+//                .config("spark.hadoop.fs.defaultFS", "hdfs://115.191.22.177:8020")
+//                .config("spark.sql.warehouse.dir", "/user/hive/warehouse")
                 .config("hive.metastore.client.socket.timeout", "300000")
                 .config("log4j.logger.org.apache.hive", "ERROR")
                 .config("log4j.logger.org.apache.hadoop", "ERROR")
@@ -1912,7 +1851,7 @@ public class LogicalPlanLineageParser {
 
         try {
             // 1. 语法解析：生成未解析的逻辑计划
-            LogicalPlan unresolvedPlan = spark.sessionState().sqlParser().parsePlan(sql);
+            LogicalPlan unresolvedPlan = spark.sessionState().sqlParser().parsePlan(new_sql);
             System.out.println("===== 1. 未解析逻辑计划（UnresolvedPlan） =====");
             System.out.println(unresolvedPlan.simpleString(10000) + "\n");
 
@@ -1920,14 +1859,6 @@ public class LogicalPlanLineageParser {
             Analyzer analyzer = spark.sessionState().analyzer();
             LogicalPlan resolvedPlan = analyzer.execute(unresolvedPlan);
 
-            // 3. 验证解析结果：检查是否还有未解析的表/字段
-            boolean hasUnresolved = resolvedPlan.exists(p -> p instanceof UnresolvedRelation);
-//            System.out.println("===== 2. 解析结果验证 =====");
-//            System.out.println("是否存在未解析的表/字段：" + (hasUnresolved ? "是（需检查元数据/配置）" : "否（解析成功）") + "\n");
-//
-//            // 4. 输出已解析的逻辑计划（用于血缘解析）
-//            System.out.println("===== 3. 已解析逻辑计划（ResolvedPlan） =====");
-//            System.out.println(resolvedPlan.simpleString(1000000) + "\n");
 
             // 5. 调用你的血缘解析方法：传入已解析的逻辑计划
             Map<String, FieldLineage> parse = parse(resolvedPlan);

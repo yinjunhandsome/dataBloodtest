@@ -15,7 +15,7 @@
         <maven.compiler.source>8</maven.compiler.source>
         <maven.compiler.target>8</maven.compiler.target>
         <scala.version>2.12.15</scala.version> <!-- 调整：Spark 3.3.4官方适配的Scala版本是2.12.15 -->
-        <spark.version>3.3.4</spark.version>
+        <spark.version>3.4.0</spark.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <!-- 新增：解决Scala反射/编译冲突 -->
         <scala.binary.version>2.12</scala.binary.version>
@@ -28,6 +28,19 @@
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-catalyst_${scala.binary.version}</artifactId>
             <version>${spark.version}</version>
+        </dependency>
+
+        <!-- Fastjson 1.x 最后稳定版（仅兼容旧项目） -->
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+            <version>1.2.83</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.bj58.dpd.dp</groupId>
+            <artifactId>dp-exp-util</artifactId>
+            <version>1.0.10</version>
         </dependency>
 
         <!-- 2. Spark SQL 核心 -->
@@ -66,6 +79,12 @@
             <artifactId>junit</artifactId>
             <version>4.13.2</version>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.38</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 
