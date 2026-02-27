@@ -64,11 +64,6 @@ public class LogicalPlanLineageParser {
             System.err.println("===== 远程Hive元数据连接/sql解析失败 =====");
             System.err.println("错误信息：" + e.getMessage());
             throw new RuntimeException(e);
-        } finally {
-            // 关闭SparkSession，释放资源
-            if (spark != null) {
-                spark.stop();
-            }
         }
     }
 
@@ -1460,15 +1455,22 @@ public class LogicalPlanLineageParser {
         String[] split = fieldName.split("\\.");
         if (split.length==1) {
             String shortName=split[0];
+            // 先尝试精确匹配
             FieldLineage fieldLineage = childFields.get(shortName);
             if (fieldLineage != null) {
                 return fieldLineage;
             }
+            // 精确匹配失败，进行忽略大小写的遍历查找
             else {
                 for (Map.Entry<String, FieldLineage> child : childFields.entrySet()) {
                     String[] children = child.getKey().split("\\.");
                     if (children.length>1) {
-                        if (StringUtils.equals(children[children.length-1], shortName)) {
+                        if (StringUtils.equalsIgnoreCase(children[children.length-1], shortName)) {
+                            return child.getValue();
+                        }
+                    } else if (children.length==1) {
+                        // 处理单层级字段名的忽略大小写匹配
+                        if (StringUtils.equalsIgnoreCase(children[0], shortName)) {
                             return child.getValue();
                         }
                     }
@@ -1477,15 +1479,17 @@ public class LogicalPlanLineageParser {
         }
         else  {
             String shortName=split[split.length-2]+"."+split[split.length-1];
+            // 先尝试精确匹配
             FieldLineage fieldLineage = childFields.get(shortName);
             if (fieldLineage != null) {
                 return fieldLineage;
             }
+            // 精确匹配失败，进行忽略大小写的遍历查找
             else {
                 for (Map.Entry<String, FieldLineage> child : childFields.entrySet()) {
                     String[] children = child.getKey().split("\\.");
                     if (children.length==1) {
-                        if (StringUtils.equals(children[0], split[split.length-1])) {
+                        if (StringUtils.equalsIgnoreCase(children[0], split[split.length-1])) {
                             return child.getValue();
                         }
                     }
@@ -1494,7 +1498,7 @@ public class LogicalPlanLineageParser {
                         FieldLineage value = child.getValue();
                         String tableName = StringUtils.isBlank(value.getTableName())?"":value.getTableName();
                         String aliasName = tableName+"."+children[split.length-1];
-                        if (StringUtils.equals(childShortName, shortName)||StringUtils.equals(shortName, aliasName)) {
+                        if (StringUtils.equalsIgnoreCase(childShortName, shortName)||StringUtils.equalsIgnoreCase(shortName, aliasName)) {
                             return child.getValue();
                         }
                     }

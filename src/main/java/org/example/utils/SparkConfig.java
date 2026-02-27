@@ -14,7 +14,7 @@ public class SparkConfig {
                 .master("local[*]")
                 .enableHiveSupport()
                 // ========== 新增：显式绑定远程Hive Metastore地址（核心） ==========
-                .config("hive.metastore.uris", "thrift://115.191.22.177:9083")
+                .config("hive.metastore.uris", "thrift://hdp-metastore-etl.58dns.org:9083")
                 // ========== 原有辅助配置保留 ==========
                 .config("spark.sql.optimizer.enabled", "false")
                 .config("spark.sql.autoBroadcastJoinThreshold", "-1")
