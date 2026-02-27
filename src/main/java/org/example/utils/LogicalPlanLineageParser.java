@@ -8,7 +8,6 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable;
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation;
 import org.apache.spark.sql.catalyst.expressions.*;
 import org.apache.spark.sql.catalyst.expressions.aggregate.*;
-import org.apache.spark.sql.catalyst.parser.ParseException;
 import org.apache.spark.sql.catalyst.plans.logical.*;
 import org.apache.spark.sql.execution.datasources.InsertIntoHadoopFsRelationCommand;
 import org.apache.spark.sql.execution.datasources.LogicalRelation;
@@ -16,11 +15,13 @@ import org.apache.spark.sql.execution.datasources.SaveIntoDataSourceCommand;
 import org.apache.spark.sql.execution.command.*;
 import org.apache.spark.sql.hive.execution.CreateHiveTableAsSelectCommand;
 import org.apache.spark.sql.hive.execution.InsertIntoHiveTable;
+import org.springframework.stereotype.Component;
 import scala.Option;
 import scala.Tuple2;
 import scala.collection.Iterator;
 import scala.collection.Seq;
 
+import javax.annotation.Resource;
 import java.util.*;
 
 /**
@@ -40,17 +41,43 @@ import java.util.*;
 //血缘
 //1.查询，查询字段->来源表字段
 //2.插入，插入字段(来源于真实表)->来源字段(常量插入为空)
+@Component
 public class LogicalPlanLineageParser {
 
-    // ==================== 调试开关 ====================
-    // 设为false关闭所有调试输出，设为true开启详细日志
+    @Resource
+    private SparkSession spark;
 
-    /**
-     * 解析入口：解析LogicalPlan生成字段级血缘
-     *
-     * @param plan Spark逻辑计划
-     * @return 字段名 -> 字段血缘 映射
-     */
+    public Map<String, Set<String>> parse(String sql){
+        try {
+            String new_sql= ExpUtils.replace(sql);
+            LogicalPlan unresolvedPlan = spark.sessionState().sqlParser().parsePlan(new_sql);
+            Analyzer analyzer = spark.sessionState().analyzer();
+            LogicalPlan resolvedPlan = analyzer.execute(unresolvedPlan);
+            Map<String, FieldLineage> parse = parse(resolvedPlan);
+            Map<String, Set<String>> allSourceFields = getAllSourceFields(parse);
+            for (Map.Entry<String, Set<String>> entry : allSourceFields.entrySet()) {
+                System.out.println(entry.getKey() + " → " + entry.getValue());
+            }
+            return allSourceFields;
+        }
+        catch (Exception e) {
+            System.err.println("===== 远程Hive元数据连接/sql解析失败 =====");
+            System.err.println("错误信息：" + e.getMessage());
+            throw new RuntimeException(e);
+        } finally {
+            // 关闭SparkSession，释放资源
+            if (spark != null) {
+                spark.stop();
+            }
+        }
+    }
+
+        /**
+         * 解析入口：解析LogicalPlan生成字段级血缘
+         *
+         * @param plan Spark逻辑计划
+         * @return 字段名 -> 字段血缘 映射
+         */
     public static Map<String, FieldLineage> parse(LogicalPlan plan) {
         if (plan == null) {
             return new HashMap<>();
@@ -190,7 +217,6 @@ public class LogicalPlanLineageParser {
             if (plan instanceof AlterTableDropPartitionCommand) {
                 return parseAlterTableDropPartitionCommand((AlterTableDropPartitionCommand) plan);
             }
-            // CacheTableCommand 和 UncacheTableCommand 在Spark 3.3.4中可能不存在，跳过
             if (plan instanceof RefreshTableCommand) {
                 return parseRefreshTableCommand((RefreshTableCommand) plan);
             }
@@ -233,7 +259,6 @@ public class LogicalPlanLineageParser {
     // ==================== CTE相关 ====================
 
     private static Map<String, FieldLineage> parseWithCTE(WithCTE plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        System.out.println("===== DEBUG: WithCTE =====");
         // 先解析所有CTE定义并缓存
         Seq<CTERelationDef> cteDefs = plan.cteDefs();
         if (cteDefs != null && !cteDefs.isEmpty()) {
@@ -242,11 +267,8 @@ public class LogicalPlanLineageParser {
             while (it.hasNext()) {
                 CTERelationDef def = it.next();
                 if (def != null) {
-                    System.out.println("  Parsing CTE: " + def.id());
-                    System.out.println("    CTE child node: " + def.child().getClass().getSimpleName());
                     try {
                         Map<String, FieldLineage> cteFields = parseLogicalPlan(def.child(), cteCache);
-                        System.out.println("  CTE " + def.id() + " has " + cteFields.size() + " fields");
                         if (cteFields.isEmpty()) {
                             System.out.println("  WARNING: CTE " + def.id() + " has NO fields!");
                         }
@@ -280,23 +302,9 @@ public class LogicalPlanLineageParser {
 
     private static Map<String, FieldLineage> parseCTERelationRef(CTERelationRef plan, Map<String, Map<String, FieldLineage>> cteCache) {
         String cacheKey = "CTE_" + plan.cteId();
-        System.out.println("===== DEBUG: CTERelationRef =====");
-        System.out.println("CTE ID: " + plan.cteId());
-        System.out.println("Cache Key: " + cacheKey);
 
         Map<String, FieldLineage> cached = cteCache.get(cacheKey);
         if (cached != null) {
-            System.out.println("Found cached CTE with " + cached.size() + " fields:");
-            for (Map.Entry<String, FieldLineage> entry : cached.entrySet()) {
-                FieldLineage lineage = entry.getValue();
-                System.out.println("  - " + entry.getKey() + " -> dependencies=" + lineage.getDependencies().size());
-                if (lineage.getDependencies().size() > 0) {
-                    for (FieldLineage dep : lineage.getDependencies()) {
-                        System.out.println("      -> " + dep.getFieldName() + " (" + dep.getTableName() + ")");
-                    }
-                }
-            }
-
             // 规范化：移除所有键的前缀，只保留纯字段名
             Map<String, FieldLineage> normalizedResult = new HashMap<>();
             for (Map.Entry<String, FieldLineage> entry : cached.entrySet()) {
@@ -307,13 +315,11 @@ public class LogicalPlanLineageParser {
                 String normalizedKey = originalKey;
                 if (originalKey.contains(".")) {
                     normalizedKey = originalKey.substring(originalKey.lastIndexOf('.') + 1);
-                    System.out.println("  Normalizing key: '" + originalKey + "' -> '" + normalizedKey + "'");
                 }
 
                 // 如果键已存在，合并依赖而不是覆盖
                 if (normalizedResult.containsKey(normalizedKey)) {
                     FieldLineage existing = normalizedResult.get(normalizedKey);
-                    System.out.println("  WARNING: Key conflict! Merging dependencies for '" + normalizedKey + "'");
                     for (FieldLineage dep : lineage.getDependencies()) {
                         existing.addDependency(cloneFieldLineage(dep));
                     }
@@ -321,11 +327,8 @@ public class LogicalPlanLineageParser {
                     normalizedResult.put(normalizedKey, lineage);
                 }
             }
-
-            System.out.println("Returning " + normalizedResult.size() + " normalized fields from cache");
             return normalizedResult;
         }
-        System.out.println("WARNING: No cached data found for CTE " + cacheKey);
         return new HashMap<>();
     }
 
@@ -409,7 +412,6 @@ public class LogicalPlanLineageParser {
     private static Map<String, FieldLineage> parseProject(Project plan, Map<String, Map<String, FieldLineage>> cteCache) {
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.child(), cteCache);
 
-        // 调试：打印 Project 的字段列表
         Seq<NamedExpression> projectList = plan.projectList();
 
         Map<String, FieldLineage> result = new HashMap<>();
@@ -851,23 +853,6 @@ public class LogicalPlanLineageParser {
                 }
             }
         }
-//        Map<String, FieldLineage> result = new HashMap<>();
-//        Seq<Attribute> output = plan.output();
-//        Iterator<Attribute> iterator = output.iterator();
-//        while (iterator.hasNext()) {
-//            Attribute attribute = iterator.next();
-//            FieldLineage fieldLineage = new FieldLineage();
-//            fieldLineage.setFieldName(attribute.name());
-//            fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
-//            for (Map.Entry<String, FieldLineage> entry : childFieldLineage.entrySet()) {
-//                String[] split = entry.getKey().split("\\.");
-//                if (split[split.length - 1].equals(attribute.name())) {
-//                    fieldLineage.getDependencies().add(entry.getValue());
-//                }
-//            }
-//            result.put(attribute.name(), fieldLineage);
-//        }
-//        return result;
           return childFieldLineage;
     }
 
@@ -886,6 +871,7 @@ public class LogicalPlanLineageParser {
     }
 
     private static Map<String, FieldLineage> parseUnknown(LogicalPlan plan, Map<String, Map<String, FieldLineage>> cteCache) {
+        //todo 这里最好日志或者数据库记录一下，有哪些算子未被捕获，后续不断扩充
         Seq<LogicalPlan> children = plan.children();
         if (children != null && !children.isEmpty()) {
             return parseLogicalPlan(children.head(), cteCache);
@@ -1062,27 +1048,6 @@ public class LogicalPlanLineageParser {
         // 删除分区操作，无血缘数据
         return new HashMap<>();
     }
-
-    /**
-     * 解析 CacheTableCommand
-     * CACHE TABLE table_name SELECT ...
-     * 注意：此命令在Spark 3.3.4中可能不存在
-     */
-    // private static Map<String, FieldLineage> parseCacheTableCommand(CacheTableCommand plan) {
-    //     System.out.println("===== DEBUG: CacheTableCommand =====");
-    //     return new HashMap<>();
-    // }
-
-    /**
-     * 解析 UncacheTableCommand
-     * UNCACHE TABLE table_name
-     * 注意：此命令在Spark 3.3.4中可能不存在
-     */
-    // private static Map<String, FieldLineage> parseUncacheTableCommand(UncacheTableCommand plan) {
-    //     System.out.println("===== DEBUG: UncacheTableCommand =====");
-    //     return new HashMap<>();
-    // }
-
     /**
      * 解析 RefreshTableCommand
      * REFRESH TABLE table_name
@@ -1488,7 +1453,6 @@ public class LogicalPlanLineageParser {
         return expr instanceof CaseWhen;
     }
 
-    //todo 重大问题
     private static FieldLineage findFieldInChildFields(String fieldName, Map<String, FieldLineage> childFields) {
         if (fieldName == null || childFields == null) {
             return null;
@@ -1596,66 +1560,6 @@ public class LogicalPlanLineageParser {
     }
 
     /**
-     * 深度克隆Map
-     */
-    private static Map<String, FieldLineage> deepCopyFieldLineageMap(Map<String, FieldLineage> original) {
-        Map<String, FieldLineage> copy = new HashMap<>();
-        for (Map.Entry<String, FieldLineage> entry : original.entrySet()) {
-            copy.put(entry.getKey(), cloneFieldLineage(entry.getValue()));
-        }
-        return copy;
-    }
-
-    /**
-     * 获取表名
-     */
-    private static String getTableName(Map<String, FieldLineage> fields) {
-        if (fields.isEmpty()) {
-            return "unknown";
-        }
-        return fields.values().iterator().next().getTableName();
-    }
-
-    // ==================== 格式化输出 ====================
-
-    /**
-     * 打印血缘结果
-     */
-    public static void printLineage(Map<String, FieldLineage> lineage) {
-        if (lineage == null || lineage.isEmpty()) {
-            System.out.println("无血缘信息");
-            return;
-        }
-
-        System.out.println("========== 字段级血缘解析结果 ==========");
-        for (Map.Entry<String, FieldLineage> entry : lineage.entrySet()) {
-            System.out.println("\n字段: " + entry.getKey());
-            System.out.println(entry.getValue().getLineageDescription());
-        }
-        System.out.println("========================================");
-    }
-
-    /**
-     * 获取血缘文本描述
-     */
-    public static String getLineageDescription(Map<String, FieldLineage> lineage) {
-        if (lineage == null || lineage.isEmpty()) {
-            return "无血缘信息";
-        }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("========== 字段级血缘解析结果 ==========\n");
-
-        for (Map.Entry<String, FieldLineage> entry : lineage.entrySet()) {
-            sb.append("\n字段: ").append(entry.getKey()).append("\n");
-            sb.append(entry.getValue().getLineageDescription());
-        }
-
-        sb.append("========================================\n");
-        return sb.toString();
-    }
-
-    /**
      * 获取所有字段及其源头字段
      */
     public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> lineage) {
@@ -1670,227 +1574,5 @@ public class LogicalPlanLineageParser {
         }
 
         return result;
-    }
-
-    public static void main(String[] args) {
-//        String sql = "WITH grade_s_products AS (SELECT qc_code, brand_id, brand_name, model_id, model_name, dt AS product_dt, weekofyear(to_date(dt, 'yyyy-MM-dd')) AS product_week, concat_ws('-', brand_name, model_name) AS full_product_name, CASE WHEN buying_price > 5000 THEN 'high_end' ELSE 'mid_low' END AS price_grade FROM hdp_zhuanzhuan_rawdb_global.raw_mysql_dbzz_bmskyway_t_skyway_product_full_1d WHERE dt >= date_format(date_sub(current_date(), 180), 'yyyy-MM-dd') AND dt <= date_format(current_date(), 'yyyy-MM-dd') AND grade = 'S' AND brand_name NOT IN ('测试品牌', '未知品牌') AND isnotnull(qc_code)), sales_orders AS (SELECT info_id, qc_code, total_amt / 100 AS real_pay_price, to_date(pay_time, 'yyyy-MM-dd HH:mm:ss') AS pay_date, weekofyear(to_date(pay_time, 'yyyy-MM-dd HH:mm:ss')) AS pay_week, row_number() OVER (PARTITION BY qc_code ORDER BY pay_time) AS sales_seq, IF(total_amt >= 10000, 'big_order', 'normal_order') AS order_level FROM hdp_ubu_zhuanzhuan_dw_b2c.dw_trade_order_ord_all_subject_dtl_full_1d WHERE dt = date_format(current_date(), 'yyyy-MM-dd') AND cate_first_id = 101 AND company_flag = 1 AND isnotnull(pay_time)), product_details AS (SELECT info_id, qc_code, spec_ram, spec_version, spec_appearance_quality, spec_function_quality, hand_price, dt AS detail_dt FROM hdp_zhuanzhuan_dw_global.dw_info_prod_detail_full_1d WHERE dt BETWEEN date_format(date_sub(current_date(), 180), 'yyyy-MM-dd') AND date_format(current_date(), 'yyyy-MM-dd') AND status = 1 AND sale_where = 1 AND spec_machine_source != 'BS机' AND is_searchable = 1), product_sales_join AS (SELECT gp.brand_id, gp.brand_name, gp.model_id, gp.model_name, gp.full_product_name, gp.price_grade, so.real_pay_price, so.pay_week, so.order_level, pd.spec_ram, pd.spec_version, pd.spec_appearance_quality, pd.hand_price AS product_list_price, ROUND((so.real_pay_price / pd.hand_price) * 100, 2) AS discount_rate FROM grade_s_products gp INNER JOIN sales_orders so ON gp.qc_code = so.qc_code LEFT JOIN product_details pd ON so.info_id = pd.info_id AND gp.qc_code = pd.qc_code WHERE so.real_pay_price > 0 AND pd.hand_price > 0) SELECT brand_name, model_name, pay_week, price_grade, spec_ram, spec_version, COUNT(DISTINCT so.info_id) AS order_count, SUM(real_pay_price) AS total_sales_amount, AVG(real_pay_price) AS avg_sales_price, MAX(real_pay_price) AS max_sales_price, MIN(real_pay_price) AS min_sales_price, AVG(discount_rate) AS avg_discount_rate, COUNT(CASE WHEN order_level = 'big_order' THEN 1 END) AS big_order_count, concat_ws('/', spec_ram, spec_version) AS product_config FROM product_sales_join GROUP BY brand_name, model_name, pay_week, price_grade, spec_ram, spec_version HAVING order_count >= 5 ORDER BY pay_week DESC, total_sales_amount DESC LIMIT 100;";
-//        String sql="WITH valid_orders AS (SELECT od.order_id,od.order_detail_id,od.user_id,u.user_name,u.member_grade,u.user_source,od.product_id,od.sku_id,od.order_num,od.unit_price,od.pay_amt,od.discount_amt,date_format (to_date (od.pay_time, 'yyyy-MM-dd HH:mm:ss'), 'yyyy-MM-dd') AS pay_date,hour (od.pay_time) AS pay_hour FROM dw_fact.fact_order_detail od INNER JOIN dw_dim.dim_user u ON od.user_id = u.user_id AND od.dt = u.dt WHERE od.dt = '2026-01-30' AND od.order_status IN (2,3,4) AND od.pay_amt > 0),order_product_relation AS (SELECT vo.*,p.product_name,p.brand_id,p.brand_name,p.cate1_id,p.cate1_name,p.cate2_name,ROUND ((1 - vo.discount_amt/vo.unit_price) * 100, 2) AS single_discount_rate FROM valid_orders vo LEFT JOIN dw_dim.dim_product p ON vo.product_id = p.product_id AND vo.dt = p.dt WHERE p.shelf_status = 1),brand_date_agg AS (SELECT brand_id,brand_name,cate1_name,pay_date,pay_hour,COUNT (DISTINCT order_id) AS order_count,COUNT (DISTINCT user_id) AS user_count,SUM (order_num) AS total_sales_num,SUM (pay_amt) AS total_pay_amt,AVG (single_discount_rate) AS avg_discount_rate,ROW_NUMBER () OVER (PARTITION BY brand_id, pay_date ORDER BY SUM (pay_amt) DESC) AS hour_sales_rank,ROUND (SUM (pay_amt) / SUM (SUM (pay_amt)) OVER (PARTITION BY cate1_name, pay_date) * 100, 2) AS cate_sales_ratio FROM order_product_relation GROUP BY brand_id, brand_name, cate1_name, pay_date, pay_hour HAVING order_count >= 3) SELECT brand_id,brand_name,cate1_name,pay_date,pay_hour,order_count,user_count,total_sales_num,CONCAT (ROUND (total_pay_amt / 10000, 2), ' 万 ') AS total_pay_amt_wan,avg_discount_rate,cate_sales_ratio,hour_sales_rank FROM brand_date_agg WHERE total_pay_amt >= 10000 OR (user_count / (SELECT COUNT (DISTINCT user_id) FROM valid_orders) >= 0.6) ORDER BY total_pay_amt DESC, order_count DESC LIMIT 50;";
-        // 本地开发：强制指定Hadoop用户（与远程Hive集群的操作用户一致，如hadoop）
-//        System.setProperty("HADOOP_USER_NAME", "hadoop");
-        // 禁用Hive元数据本地缓存，强制走远程（本地开发必配）
-//        System.setProperty("hive.metastore.cache.pinobjtypes", "NONE");
-//        System.setProperty("hive.metastore.cache.expireAfter", "0s");
-
-        // 构建SparkSession：本地解析血缘专属配置
-        String sql = "WITH user_order_detail AS (\n" +
-                "    -- 关联用户表、订单表、订单明细表，整合基础信息\n" +
-                "    SELECT\n" +
-                "        u.user_id,\n" +
-                "        u.user_name,\n" +
-                "        o.order_id,\n" +
-                "        o.order_amount,\n" +
-                "        o.create_time AS order_create_time,\n" +
-                "        oi.item_id,\n" +
-                "        oi.goods_id,\n" +
-                "        oi.goods_num,\n" +
-                "        oi.goods_price,\n" +
-                "        -- 计算单商品的小计金额\n" +
-                "        oi.goods_num * oi.goods_price AS goods_subtotal,\n" +
-                "        -- 【不存在字段】测试血缘：t_order表中无此字段\n" +
-                "        o.nonexistent_order_field\n" +
-                "    FROM t_user u\n" +
-                "    INNER JOIN t_order o \n" +
-                "        ON u.user_id = o.user_id\n" +
-                "    INNER JOIN t_order_item oi \n" +
-                "        ON o.order_id = oi.order_id\n" +
-                "    WHERE o.order_date >= '2026-01-01' -- 筛选2026年的订单\n" +
-                ")\n" +
-                "-- 主查询：计算用户维度的统计指标\n" +
-                "SELECT\n" +
-                "    user_id,\n" +
-                "    user_name,\n" +
-                "    order_id,\n" +
-                "    order_create_time,\n" +
-                "    goods_id,\n" +
-                "    goods_num,\n" +
-                "    goods_price,\n" +
-                "    goods_subtotal,\n" +
-                "    -- 计算单订单的商品总金额（同订单下所有商品小计之和）\n" +
-                "    SUM(goods_subtotal) OVER (PARTITION BY order_id) AS order_goods_total,\n" +
-                "    -- 计算用户的累计消费金额（用户所有订单的商品总金额之和）\n" +
-                "    SUM(goods_subtotal) OVER (PARTITION BY user_id) AS user_total_consume,\n" +
-                "    -- 计算用户的订单数排名（按下单时间倒序）\n" +
-                "    ROW_NUMBER() OVER (\n" +
-                "        PARTITION BY user_id \n" +
-                "        ORDER BY order_create_time DESC\n" +
-                "    ) AS user_order_rn,\n" +
-                "    nonexistent_order_field\n" +
-                "FROM user_order_detail\n" +
-                "ORDER BY user_id, user_order_rn; -- 关键修正：添加英文分号，结束SQL语句";
-        sql = "\n" +
-                "\n" +
-                "\n" +
-                "insert OVERWRITE table  hdp_ubu_zhuanzhuan_ads_media.ads_order_period_analysis_full_1d\n" +
-                "PARTITION(dt='${outFileSuffix}') \n" +
-                "\n" +
-                "select \n" +
-                "substr(pay_time,1,4) as pay_year\n" +
-                ",substr(pay_time,1,10) as pay_date\n" +
-                ",period_v1\n" +
-                ",period\n" +
-                ",amount_range\n" +
-                "--,brand_type\n" +
-                ",count(distinct order_id) as order_cnt\n" +
-                ",sum(total_amt) as gmv\n" +
-                "from (\n" +
-                "select \n" +
-                "order_id\n" +
-                ",t1.brand_name\n" +
-                ",t1.model_name\n" +
-                ",case \n" +
-                "    when t2.amoeba_unit='折叠屏' then '折叠屏' \n" +
-                "    when t1.brand_name in ('苹果','华为','小米','OPPO','vivo','IQOO','红米','realme','荣耀','三星','一加') then t1.brand_name\n" +
-                "    else '其他'\n" +
-                "end as brand_type\n" +
-                ",total_amt/100 as total_amt\n" +
-                ",case \n" +
-                "    when total_amt/100 <= 500 then '0-500'\n" +
-                "    when total_amt/100 <= 1000 then '500-1000'\n" +
-                "    when total_amt/100 <= 1500 then '1000-1500'\n" +
-                "    when total_amt/100 <= 2000 then '1500-2000'\n" +
-                "    when total_amt/100 <= 2500 then '2000-2500'\n" +
-                "    when total_amt/100 <= 3000 then '2500-3000'\n" +
-                "    when total_amt/100 <= 3500 then '3000-3500'\n" +
-                "    when total_amt/100 <= 4000 then '3500-4000'\n" +
-                "    when total_amt/100 <= 4500 then '4000-4500'\n" +
-                "    when total_amt/100 <= 5000 then '4500-5000'\n" +
-                "    when total_amt/100 <= 5500 then '5000-5500'\n" +
-                "    when total_amt/100 <= 6000 then '5500-6000'\n" +
-                "    else '6000+'\n" +
-                "end as amount_range\n" +
-                ",case \n" +
-                "    when substr(pay_time,1,7) in ('2024-07','2024-08') then '24年暑假'\n" +
-                "    when substr(pay_time,1,7) in ('2025-07','2025-08') then '25年暑假'\n" +
-                "    when substr(pay_time,1,7) = '2024-06' then '24年6月'\n" +
-                "    when substr(pay_time,1,7) = '2025-06' then '25年6月'\n" +
-                "    when date(pay_time) between '2026-02-17' and '2026-02-23' then '26年氢弹'\n" +
-                "    when date(pay_time) between '2025-01-29' and '2025-02-04' then '25年氢弹'\n" +
-                "    when substr(pay_time,1,7) = '2026-01' then '26年1月'\n" +
-                "    when substr(pay_time,1,7) = '2024-12' then '24年12月'\n" +
-                "    else '其他'\n" +
-                "end as period\n" +
-                ",case \n" +
-                "    when substr(pay_time,1,7) in ('2024-07','2024-08') then '暑假'\n" +
-                "    when substr(pay_time,1,7) in ('2025-07','2025-08') then '暑假'\n" +
-                "    when substr(pay_time,1,7) = '2024-06' then '6月'\n" +
-                "    when substr(pay_time,1,7) = '2025-06' then '6月'\n" +
-                "    when date(pay_time) between '2026-02-17' and '2026-02-23' then '氢弹'\n" +
-                "    when date(pay_time) between '2025-01-29' and '2025-02-04' then '氢弹'\n" +
-                "    when substr(pay_time,1,7) = '2026-01' then '氢弹前1个月'\n" +
-                "    when substr(pay_time,1,7) = '2024-12' then '氢弹前1个月'\n" +
-                "    else '其他'\n" +
-                "end as period_v1\n" +
-                ",nvl(t2.amoeba_unit,'未知') as amoeba_unit\n" +
-                ",t1.pay_time\n" +
-                "from hdp_ubu_zhuanzhuan_dw_b2c.dw_trade_order_ord_all_subject_dtl_full_1d t1 \n" +
-                "left join hdp_zhuanzhuan_dim_global.dim_b2c_amobarole_model_0p t2 \n" +
-                "on t1.model_id=t2.model_id  \n" +
-                "where dt=date_sub(current_date,1)\n" +
-                "and cate_first_id=101\n" +
-                "and is_exchange_order_flag=0\n" +
-                "and is_pure_pay_the_day=1\n" +
-                "--and company_flag=1\n" +
-                "and (\n" +
-                "    -- 24年暑假：7-8月\n" +
-                "    substr(pay_time,1,7) in ('2024-07','2024-08')\n" +
-                "    -- 25年暑假：7-8月\n" +
-                "    or substr(pay_time,1,7) in ('2025-07','2025-08')\n" +
-                "    -- 24年6月\n" +
-                "    or substr(pay_time,1,7) = '2024-06'\n" +
-                "    -- 25年6月\n" +
-                "    or substr(pay_time,1,7) = '2025-06'\n" +
-                "    -- 26年氢弹：02.17-02.23\n" +
-                "    or (date(pay_time) between '2026-02-17' and '2026-02-23')\n" +
-                "    -- 25年氢弹：1.29-02.04\n" +
-                "    or (date(pay_time) between '2025-01-29' and '2025-02-04')\n" +
-                "    -- 26年1月\n" +
-                "    or substr(pay_time,1,7) = '2026-01'\n" +
-                "    -- 24年12月\n" +
-                "    or substr(pay_time,1,7) = '2024-12'\n" +
-                ")\n" +
-                ") t \n" +
-                "group by \n" +
-                "substr(pay_time,1,4)\n" +
-                "    ,substr(pay_time,1,10)\n" +
-                "    ,period_v1\n" +
-                "    ,period\n" +
-                "    ,amount_range\n" +
-                "   -- ,brand_type \n";
-        String new_sql= ExpUtils.replace(sql);
-        System.out.println(new_sql);
-
-        SparkSession spark = SparkSession.builder()
-                .appName("LocalHiveLineageParser")
-                .master("local[*]")
-                .enableHiveSupport()
-                // ========== 新增：显式绑定远程Hive Metastore地址（核心） ==========
-                .config("hive.metastore.uris", "thrift://hdp-metastore-etl.58dns.org:9083")
-                // ========== 原有辅助配置保留 ==========
-                .config("spark.sql.optimizer.enabled", "false")
-                .config("spark.sql.autoBroadcastJoinThreshold", "-1")
-                .config("spark.sql.adaptive.enabled", "false")
-//                .config("spark.hadoop.fs.defaultFS", "hdfs://115.191.22.177:8020")
-//                .config("spark.sql.warehouse.dir", "/user/hive/warehouse")
-                .config("hive.metastore.client.socket.timeout", "300000")
-                .config("log4j.logger.org.apache.hive", "ERROR")
-                .config("log4j.logger.org.apache.hadoop", "ERROR")
-                .getOrCreate();
-
-        // 屏蔽Spark冗余日志，只看关键输出
-        spark.sparkContext().setLogLevel("ERROR");
-
-        try {
-            // 1. 语法解析：生成未解析的逻辑计划
-            LogicalPlan unresolvedPlan = spark.sessionState().sqlParser().parsePlan(new_sql);
-            System.out.println("===== 1. 未解析逻辑计划（UnresolvedPlan） =====");
-            System.out.println(unresolvedPlan.simpleString(10000) + "\n");
-
-            // 2. 元数据解析：关联远程Hive Metastore，解析库表/字段元数据（核心步骤）
-            Analyzer analyzer = spark.sessionState().analyzer();
-            LogicalPlan resolvedPlan = analyzer.execute(unresolvedPlan);
-
-
-            // 5. 调用你的血缘解析方法：传入已解析的逻辑计划
-            Map<String, FieldLineage> parse = parse(resolvedPlan);
-            System.out.println("===== 4. 血缘解析结果 =====");
-            Map<String, Set<String>> outputToSourceMapping = new HashMap<>();
-
-            for (Map.Entry<String, FieldLineage> entry : parse.entrySet()) {
-                String outputField = entry.getKey();
-                Set<String> sourceFields = entry.getValue().getAllSourceFields();
-                outputToSourceMapping.put(outputField, sourceFields);
-            }
-
-            // 3. 打印映射
-            System.out.println("========== 字段映射关系 ==========");
-            for (Map.Entry<String, Set<String>> entry : outputToSourceMapping.entrySet()) {
-                System.out.println(entry.getKey() + " → " + entry.getValue());
-            }
-            // 此处可添加血缘结果的打印/解析逻辑（如递归输出字段依赖）
-
-        } catch (ParseException e) {
-            System.err.println("===== SQL语法解析失败 =====");
-            System.err.println("错误信息：" + e.getMessage());
-        } catch (Exception e) {
-            System.err.println("===== 远程Hive元数据连接/解析失败 =====");
-            System.err.println("错误信息：" + e.getMessage());
-            // 打印关键堆栈，定位核心问题（无需打印全量堆栈）
-            e.printStackTrace();
-        } finally {
-            // 关闭SparkSession，释放资源
-            if (spark != null) {
-                spark.stop();
-            }
-        }
     }
 }

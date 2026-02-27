@@ -4,17 +4,28 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <!-- Spring Boot 父项目 -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.18</version>
+        <relativePath/>
+    </parent>
+
     <!-- 基础配置 -->
     <groupId>com.example</groupId>
     <artifactId>spark-logical-plan-parser</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <!-- 属性配置（统一版本，严格匹配Spark 3.3.4） -->
+    <name>spark-logical-plan-parser</name>
+    <description>Spark Logical Plan Parser with Spring Boot</description>
+
+    <!-- 属性配置（统一版本，严格匹配Spark 3.4.0） -->
     <properties>
         <maven.compiler.source>8</maven.compiler.source>
         <maven.compiler.target>8</maven.compiler.target>
-        <scala.version>2.12.15</scala.version> <!-- 调整：Spark 3.3.4官方适配的Scala版本是2.12.15 -->
+        <scala.version>2.12.15</scala.version> <!-- 调整：Spark 3.4.0官方适配的Scala版本是2.12.15 -->
         <spark.version>3.4.0</spark.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <!-- 新增：解决Scala反射/编译冲突 -->
@@ -23,6 +34,12 @@
 
     <!-- 核心依赖（关键修改：补充catalyst包，调整scope） -->
     <dependencies>
+        <!-- Spring Boot Starter Web -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
         <!-- 1. Spark Catalyst核心（必须引：NamedExpression.sql()在这个包中） -->
         <dependency>
             <groupId>org.apache.spark</groupId>
@@ -144,32 +161,19 @@
                 </executions>
             </plugin>
 
-            <!-- 3. 打包插件（优化：排除Spark自带依赖，避免包过大） -->
+            <!-- 3. Spring Boot 打包插件 -->
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-assembly-plugin</artifactId>
-                <version>3.6.0</version>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <descriptorRefs>
-                        <descriptorRef>jar-with-dependencies</descriptorRef>
-                    </descriptorRefs>
-                    <archive>
-                        <manifest>
-                            <mainClass>com.example.SparkLogicalPlanParser</mainClass> <!-- 替换为你的主类 -->
-                            <addClasspath>true</addClasspath>
-                        </manifest>
-                    </archive>
-                    <!-- 新增：排除Spark的provided依赖，避免打包冲突 -->
+                    <mainClass>org.example.Application</mainClass>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
                 </configuration>
-                <executions>
-                    <execution>
-                        <id>make-assembly</id>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>single</goal>
-                        </goals>
-                    </execution>
-                </executions>
             </plugin>
 
             <!-- 4. 新增：依赖冲突解决插件 -->
