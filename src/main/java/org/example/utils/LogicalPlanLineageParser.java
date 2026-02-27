@@ -355,7 +355,6 @@ public class LogicalPlanLineageParser {
         String dbName = table.database() != null ? table.database() : "default";
         String tblName = table.identifier().table();
         String fullTableName = dbName + "." + tblName;
-
         Seq<AttributeReference> output = plan.output();
         if (output != null && !output.isEmpty()) {
             Iterator<AttributeReference> it = output.iterator();
@@ -379,10 +378,24 @@ public class LogicalPlanLineageParser {
         String tblName = plan.tableMeta().identifier().table();
         String fullTableName = dbName + "." + tblName;
         Seq<AttributeReference> output = plan.dataCols();
+        Seq<AttributeReference> partitionCols = plan.partitionCols();
         if (output != null && !output.isEmpty()) {
             Iterator<AttributeReference> it = output.iterator();
             while (it.hasNext()) {
                 Attribute attr = it.next();
+                if (attr != null) {
+                    String fieldName = attr.name();
+                    FieldLineage lineage = new FieldLineage(fieldName, fullTableName);
+                    lineage.setFieldType(FieldLineage.FieldType.COLUMN);
+                    lineage.setSourceTableName(fullTableName);
+                    result.put(fieldName, lineage);
+                }
+            }
+        }
+        if (partitionCols != null && !partitionCols.isEmpty()) {
+            Iterator<AttributeReference> iterator = partitionCols.iterator();
+            while (iterator.hasNext()) {
+                Attribute attr = iterator.next();
                 if (attr != null) {
                     String fieldName = attr.name();
                     FieldLineage lineage = new FieldLineage(fieldName, fullTableName);
