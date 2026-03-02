@@ -714,17 +714,36 @@ public class LogicalPlanLineageParser {
                         // Generator没有sql()方法，使用toString()代替
                         lineage.setExpression(plan.generator().toString());
 
-                        // Generator提取依赖：通过Generator的输入字段
+                        // 关键修复：只提取 generator 表达式中实际使用的字段依赖
+                        // Generator 实际上是一元表达式，通过反射获取其子表达式
                         Set<String> depNames = new HashSet<>();
-                        // 获取Generate节点的所有输入字段
-                        Seq<Attribute> inputAttrs = plan.child().output();
-                        if (inputAttrs != null && !inputAttrs.isEmpty()) {
-                            Iterator<Attribute> inputIt = inputAttrs.iterator();
-                            while (inputIt.hasNext()) {
-                                Attribute inputAttr = inputIt.next();
-                                if (inputAttr != null) {
-                                    depNames.add(inputAttr.name());
+                        try {
+                            Generator generator = plan.generator();
+
+                            // 尝试通过反射获取 generator 的内部字段
+                            // Generator 通常继承自 UnaryExpr，有一个子表达式
+                            java.lang.reflect.Field[] fields = generator.getClass().getSuperclass().getDeclaredFields();
+                            for (java.lang.reflect.Field field : fields) {
+                                if (field.getName().equals("child")) {
+                                    field.setAccessible(true);
+                                    Object childObj = field.get(generator);
+                                    if (childObj instanceof Expression) {
+                                        Expression childExpr = (Expression) childObj;
+                                        depNames.addAll(extractDependencies(childExpr));
+                                    }
+                                    break;
                                 }
+                            }
+                        } catch (Exception e) {
+                            // 反射失败，使用 toString() 解析作为备选方案
+                            String generatorStr = plan.generator().toString();
+                            // 简单的字符串匹配：提取括号中的字段名
+                            // 例如: explode(all_city_names) -> all_city_names
+                            int openParen = generatorStr.indexOf('(');
+                            int closeParen = generatorStr.lastIndexOf(')');
+                            if (openParen > 0 && closeParen > openParen) {
+                                String innerExpr = generatorStr.substring(openParen + 1, closeParen);
+                                depNames.add(innerExpr);
                             }
                         }
 
@@ -844,24 +863,97 @@ public class LogicalPlanLineageParser {
     // ==================== 集合操作 ====================
 
     private static Map<String, FieldLineage> parseUnion(Union plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        Map<String, FieldLineage> childFieldLineage = new HashMap<>();
+        // 第一遍：解析所有分支
+        List<Map<String, FieldLineage>> allBranches = new ArrayList<>();
         Seq<LogicalPlan> children = plan.children();
         if (children != null && !children.isEmpty()) {
             Iterator<LogicalPlan> it = children.iterator();
             while (it.hasNext()) {
                 Map<String, FieldLineage> child = parseLogicalPlan(it.next(), cteCache);
-                for (Map.Entry<String, FieldLineage> entry : child.entrySet()) {
-                    if (childFieldLineage.containsKey(entry.getKey())) {
-                        FieldLineage fieldLineage = childFieldLineage.get(entry.getKey());
-                        fieldLineage.getDependencies().add(entry.getValue());
+                allBranches.add(child);
+            }
+        }
+
+        // 如果只有一个分支，直接返回
+        if (allBranches.size() == 1) {
+            return allBranches.get(0);
+        }
+
+        // 第二遍：合并相同名字的字段
+        // 关键修复：提取纯字段名（去掉表前缀）作为 key
+        Map<String, List<FieldLineage>> fieldsByName = new HashMap<>();
+        for (Map<String, FieldLineage> branch : allBranches) {
+            for (Map.Entry<String, FieldLineage> entry : branch.entrySet()) {
+                String fullFieldName = entry.getKey();
+                // 提取纯字段名（去掉表前缀）
+                String simpleFieldName = fullFieldName;
+                if (fullFieldName.contains(".")) {
+                    simpleFieldName = fullFieldName.substring(fullFieldName.lastIndexOf('.') + 1);
+                }
+
+                if (!fieldsByName.containsKey(simpleFieldName)) {
+                    fieldsByName.put(simpleFieldName, new ArrayList<>());
+                }
+                fieldsByName.get(simpleFieldName).add(entry.getValue());
+            }
+        }
+
+        // 为每个纯字段名创建合并后的血缘
+        Map<String, FieldLineage> result = new HashMap<>();
+        for (Map.Entry<String, List<FieldLineage>> entry : fieldsByName.entrySet()) {
+            String simpleFieldName = entry.getKey();
+            List<FieldLineage> branchFields = entry.getValue();
+
+            // 为该字段创建一个新的血缘对象
+            FieldLineage unionLineage = new FieldLineage(simpleFieldName, "UNION");
+            unionLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+            // 收集所有分支中该字段的源字段
+            Set<String> addedSignatures = new HashSet<>();
+            for (int i = 0; i < branchFields.size(); i++) {
+                FieldLineage branchField = branchFields.get(i);
+
+                Set<String> sourceFields = branchField.getAllSourceFields();
+
+                // 关键修复：直接获取该字段的所有源字段（getAllSourceFields 返回的 Set<String>）
+                // 然后为每个源字段创建一个 FieldLineage 对象作为依赖
+                if (!sourceFields.isEmpty()) {
+                    // 有源字段，遍历添加
+                    for (String sourceField : sourceFields) {
+                        // sourceField 的格式是 "tableName.fieldName"
+                        if (!addedSignatures.contains(sourceField)) {
+                            addedSignatures.add(sourceField);
+                            // 解析 sourceField
+                            String[] parts = sourceField.split("\\.");
+                            if (parts.length >= 2) {
+                                String sourceTableName = sourceField.substring(0, sourceField.lastIndexOf('.'));
+                                String sourceFieldName = sourceField.substring(sourceField.lastIndexOf('.') + 1);
+                                // 创建源字段的 FieldLineage
+                                FieldLineage sourceLineage = new FieldLineage(sourceFieldName, sourceTableName);
+                                sourceLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+                                sourceLineage.setSourceTableName(sourceTableName);
+                                unionLineage.addDependency(sourceLineage);
+                            }
+                        }
                     }
-                    else  {
-                        childFieldLineage.put(entry.getKey(), entry.getValue());
+                } else {
+                    // 没有源字段（branchField 本身可能是源头字段）
+                    // 直接添加 branchField 的信息作为源
+                    String signature = branchField.getFieldName() + "@" + branchField.getTableName();
+                    if (!addedSignatures.contains(signature) && branchField.getSourceTableName() != null) {
+                        addedSignatures.add(signature);
+                        FieldLineage sourceLineage = new FieldLineage(branchField.getFieldName(), branchField.getTableName());
+                        sourceLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+                        sourceLineage.setSourceTableName(branchField.getSourceTableName());
+                        unionLineage.addDependency(sourceLineage);
                     }
                 }
             }
+
+            result.put(simpleFieldName, unionLineage);
         }
-          return childFieldLineage;
+
+        return result;
     }
 
     private static Map<String, FieldLineage> parseIntersect(Intersect plan, Map<String, Map<String, FieldLineage>> cteCache) {
@@ -957,13 +1049,10 @@ public class LogicalPlanLineageParser {
      * INSERT OVERWRITE TABLE hive_table SELECT ...
      */
     private static Map<String, FieldLineage> parseInsertIntoHiveTable(InsertIntoHiveTable plan, Map<String, Map<String, FieldLineage>> cteCache) {
-        System.out.println("===== DEBUG: InsertIntoHiveTable =====");
-
         // 获取目标表信息
         String tableName = plan.table().identifier().table();
         String dbName = plan.table().identifier().database().getOrElse(()->"default");
         String fullName = dbName + "." + tableName;
-        boolean overwrite = plan.overwrite();
 
         // 解析查询部分的血缘
         Map<String, FieldLineage> childFields = parseLogicalPlan(plan.query(), cteCache);
@@ -972,7 +1061,15 @@ public class LogicalPlanLineageParser {
         Map<String, FieldLineage> result = new HashMap<>();
         for (Map.Entry<String, FieldLineage> entry : childFields.entrySet()) {
             FieldLineage lineage = cloneFieldLineage(entry.getValue());
-            result.put(fullName+"."+entry.getKey(), lineage);
+            // 只保留简单字段名（去掉可能的表前缀）
+            String simpleFieldName = entry.getKey();
+            if (simpleFieldName.contains(".")) {
+                simpleFieldName = simpleFieldName.substring(simpleFieldName.lastIndexOf('.') + 1);
+            }
+            lineage.setTableName(fullName);
+            lineage.setSourceTableName(fullName);
+            lineage.setFieldName(fullName + "." + simpleFieldName);
+            result.put(fullName + "." + simpleFieldName, lineage);
         }
 
         return result;
