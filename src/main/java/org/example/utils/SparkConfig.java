@@ -1,10 +1,12 @@
 package org.example.utils;
 
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.io.File;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * Spark 配置类
@@ -12,6 +14,16 @@ import java.io.File;
  */
 @Configuration
 public class SparkConfig {
+
+    // 常见的自定义 Hive UDF 列表（可根据实际情况扩展）
+    // 注意：不要包含 Spark 内置函数（如 get_json_object, parse_url 等）
+    private static final List<String> CUSTOM_HIVE_UDFS = Arrays.asList(
+            "get_biz_name",
+            "get_biz_id",
+            "get_dept_name",
+            "get_user_name"
+            // 添加更多自定义 UDF 名称...
+    );
 
     @Bean
     public SparkSession getSparkSession() {
@@ -65,11 +77,35 @@ public class SparkConfig {
                 // 禁用自适应查询执行
                 .config("spark.sql.adaptive.enabled", "false")
 
+                // ========== Parquet/Hive 兼容性配置 ==========
+                // 禁用 Hive 表到 Parquet 的转换规则，避免 ParquetOptions 初始化失败
+                .config("spark.sql.hive.convertMetastoreParquet", "false")
+                // 禁用其他文件格式转换
+                .config("spark.sql.hive.convertMetastoreOrc", "false")
+                // 使用原生 Hive 表扫描，避免触发 Parquet 相关类
+                .config("spark.sql.hive.filesourcePartitionPruning", "false")
+                // 禁用 Cascading 优化（可能与旧版 Hadoop 不兼容）
+                .config("spark.sql.parquet.enableVectorizedReader", "false")
+                .config("spark.sql.orc.enableVectorizedReader", "false")
+                // 禁用 Parquet schema 合并，避免访问 LZ4 字段
+                .config("spark.sql.parquet.mergeSchema", "false")
+                // 禁用所有文件格式的转换规则
+                .config("spark.sql.hive.convertInsertDontTouchSchema", "true")
+                // 强制使用 Hive SerDe，避免 Spark 的 Parquet/Orc 处理器
+                .config("spark.sql.hive.useHiveSerDe", "true")
+                // 禁用持续的分区发现
+                .config("spark.sql.hive.manageFilesourcePartitions", "false")
+                .config("spark.sql.streaming.fileSource.compression.codec", "uncompressed")
+
                 // ========== 网络配置 ==========
                 // Hive metastore 客户端连接超时时间（5分钟）
                 .config("hive.metastore.client.socket.timeout", "300000")
 
                 .getOrCreate();
+
+        // 注册自定义 Hive UDF 的占位符函数
+        // 这些 UDF 只用于 SQL 解析和血缘分析，不需要实际执行
+        registerPlaceholderUDFs(spark);
 
         // 屏蔽 Spark 冗余日志，只看关键输出
         spark.sparkContext().setLogLevel("ERROR");
@@ -77,5 +113,37 @@ public class SparkConfig {
         System.out.println("===== SparkSession 创建成功 =====");
 
         return spark;
+
+    }
+
+    /**
+     * 注册自定义 Hive UDF 的占位符函数
+     * 这些函数用于 SQL 解析和血缘分析，不实际执行业务逻辑
+     *
+     * 使用 Spark 3.x 的 UDF 注册方式，支持可变参数
+     *
+     * @param spark SparkSession
+     */
+    private void registerPlaceholderUDFs(SparkSession spark) {
+        for (String udfName : CUSTOM_HIVE_UDFS) {
+            try {
+                // 注册支持可变参数的 UDF
+                // 使用 varargs 方式接受任意数量的参数
+                spark.udf().register(udfName, (Object... args) -> {
+                    // 返回占位符值，实际血缘分析不需要执行真正的 UDF 逻辑
+                    return "PLACEHOLDER";
+                }, DataTypes.StringType);
+
+                System.out.println("已注册占位符 UDF: " + udfName);
+            } catch (Exception e) {
+                // 如果 varargs 注册失败，尝试注册单参数版本
+                try {
+                    spark.udf().register(udfName, (Object input) -> "PLACEHOLDER", DataTypes.StringType);
+                    System.out.println("已注册占位符 UDF (单参数版本): " + udfName);
+                } catch (Exception e2) {
+                    System.err.println("注册 UDF 失败 [" + udfName + "]: " + e2.getMessage());
+                }
+            }
+        }
     }
 }
