@@ -34,7 +34,7 @@ public class SparkConfig {
 
                 // ========== 远程 Hive Metastore 配置 ==========
                 // 连接到远程 Hive 元数据服务，获取表结构信息
-                .config("hive.metastore.uris", "thrift://hdp-metastore-etl.58dns.org:9083")
+                .config("hive.metastore.uris", "thrift://xxxxxx:9083")
 
                 // ========== ViewFs 配置（解决远程集群 ViewFs 挂载表问题） ==========
                 // 将 viewfs://58-cluster/ 路径映射到本地目录，避免访问远程 HDFS
