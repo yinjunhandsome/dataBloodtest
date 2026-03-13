@@ -27,12 +27,12 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
     public static class ParseResult {
         private String sqlType;
         private String targetTable;
-        private Map<String, org.example.utils.FieldLineage> fieldLineages;  // 使用统一的 FieldLineage
+        private Map<String, FieldLineage> fieldLineages;  // 使用统一的 FieldLineage
         private Set<String> sourceTables;
         private boolean validated;
 
         public ParseResult(String sqlType, String targetTable,
-                          Map<String, org.example.utils.FieldLineage> fieldLineages,
+                          Map<String, FieldLineage> fieldLineages,
                           Set<String> sourceTables, boolean validated) {
             this.sqlType = sqlType;
             this.targetTable = targetTable;
@@ -49,7 +49,7 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
             sb.append("Source Tables: ").append(sourceTables).append("\n");
             sb.append("Validated: ").append(validated ? "Yes" : "No").append("\n");
             sb.append("Field Lineages:\n");
-            for (Map.Entry<String, org.example.utils.FieldLineage> entry : fieldLineages.entrySet()) {
+            for (Map.Entry<String, FieldLineage> entry : fieldLineages.entrySet()) {
                 sb.append("  ").append(entry.getKey()).append(":\n");
                 sb.append("    ").append(entry.getValue().getLineageDescription());
             }
@@ -58,8 +58,8 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
 
         public String getSqlType() { return sqlType; }
         public String getTargetTable() { return targetTable; }
-        public Map<String, org.example.utils.FieldLineage> getFieldLineagesMap() { return fieldLineages; }
-        public Collection<org.example.utils.FieldLineage> getFieldLineages() { return fieldLineages.values(); }
+        public Map<String, FieldLineage> getFieldLineagesMap() { return fieldLineages; }
+        public Collection<FieldLineage> getFieldLineages() { return fieldLineages.values(); }
         public Set<String> getSourceTables() { return sourceTables; }
         public boolean isValidated() { return validated; }
     }
@@ -185,18 +185,17 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
      * @return ParseResult 包含字段血缘信息的解析结果
      */
     public ParseResult parseFieldLineageWithMetadata(String sql) throws ParseException, Exception {
-        // 先进行基础解析
+        // 先进行基础解析（现在返回的就是 FieldLineage）
         HiveLineageParser.ParseResult baseResult = parseFieldLineage(sql);
 
-        Map<String, org.example.utils.FieldLineage> fieldLineages = new HashMap<>();
+        Map<String, FieldLineage> fieldLineages = new HashMap<>();
         boolean allValidated = true;
 
         if (!isConnected()) {
             System.out.println("Warning: Not connected to Metastore, returning basic lineage without metadata");
-            // 转换为 FieldLineage 格式（没有元数据）
-            for (HiveLineageParser.FieldLineage lineage : baseResult.getFieldLineages()) {
-                org.example.utils.FieldLineage fieldLineage = convertToFieldLineage(lineage, null);
-                fieldLineages.put(lineage.getTargetField(), fieldLineage);
+            // 直接使用已经解析好的 FieldLineage
+            for (FieldLineage lineage : baseResult.getFieldLineages()) {
+                fieldLineages.put(lineage.getFieldName(), lineage);
             }
             return new ParseResult(
                 baseResult.getSqlType(), baseResult.getTargetTable(),
@@ -204,52 +203,30 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
             );
         }
 
-        // 绑定元数据并转换为 FieldLineage 结构
-        for (HiveLineageParser.FieldLineage lineage : baseResult.getFieldLineages()) {
+        // 绑定元数据验证
+        for (FieldLineage lineage : baseResult.getFieldLineages()) {
             try {
-                // 创建目标字段血缘
-                org.example.utils.FieldLineage targetField = new org.example.utils.FieldLineage();
-                targetField.setFieldName(lineage.getTargetField());
-                targetField.setTableName(baseResult.getTargetTable() != null ? baseResult.getTargetTable() : "QUERY_RESULT");
-
-                // 判断字段类型
-                org.example.utils.FieldLineage.FieldType fieldType = determineFieldType(lineage);
-                targetField.setFieldType(fieldType);
-
-                targetField.setExpression(lineage.getTransformExpr());
-
-                // 创建源字段血缘
-                org.example.utils.FieldLineage sourceField = new org.example.utils.FieldLineage();
-                sourceField.setFieldName(lineage.getSourceField());
-                sourceField.setTableName(lineage.getSourceTable());
-                sourceField.setSourceTableName(lineage.getSourceTable()); // 直接源表
-
-                // 验证并获取源字段信息
-                FieldSchema sourceFieldSchema = validateField(lineage.getSourceTable(), lineage.getSourceField());
-                if (sourceFieldSchema != null) {
-                    sourceField.setExpression(null); // 源字段没有表达式
-                } else {
-                    allValidated = false;
-                    System.out.println("Warning: Source field not found in Metastore: " +
-                        lineage.getSourceTable() + "." + lineage.getSourceField());
+                // 验证依赖字段
+                for (FieldLineage dependency : lineage.getDependencies()) {
+                    FieldSchema sourceFieldSchema = validateField(
+                        dependency.getTableName(),
+                        dependency.getFieldName()
+                    );
+                    if (sourceFieldSchema == null) {
+                        allValidated = false;
+                        System.out.println("Warning: Source field not found in Metastore: " +
+                            dependency.getTableName() + "." + dependency.getFieldName());
+                    }
                 }
 
-                // 设置依赖关系
-                targetField.getDependencies().add(sourceField);
-
-                fieldLineages.put(lineage.getTargetField(), targetField);
+                fieldLineages.put(lineage.getFieldName(), lineage);
 
             } catch (Exception e) {
                 allValidated = false;
-                System.err.println("Error validating field " + lineage.getTargetTable() + "." +
-                    lineage.getTargetField() + ": " + e.getMessage());
-                // 添加未验证的血缘记录
-                org.example.utils.FieldLineage targetField = new org.example.utils.FieldLineage();
-                targetField.setFieldName(lineage.getTargetField());
-                targetField.setTableName(baseResult.getTargetTable());
-                targetField.setFieldType(org.example.utils.FieldLineage.FieldType.ERROR);
-                targetField.setExpression(lineage.getTransformExpr());
-                fieldLineages.put(lineage.getTargetField(), targetField);
+                System.err.println("Error validating field " + lineage.getTableName() + "." +
+                    lineage.getFieldName() + ": " + e.getMessage());
+                lineage.setFieldType(FieldLineage.FieldType.ERROR);
+                fieldLineages.put(lineage.getFieldName(), lineage);
             }
         }
 
@@ -260,95 +237,17 @@ public class MetaStoreBasedLineageParser extends HiveLineageParser {
     }
 
     /**
-     * 将旧的 FieldLineage 转换为新的 FieldLineage 结构
-     */
-    private org.example.utils.FieldLineage convertToFieldLineage(HiveLineageParser.FieldLineage oldLineage, FieldSchema fieldSchema) {
-        org.example.utils.FieldLineage newLineage = new org.example.utils.FieldLineage();
-        newLineage.setFieldName(oldLineage.getTargetField());
-        newLineage.setTableName(oldLineage.getTargetTable());
-        newLineage.setExpression(oldLineage.getTransformExpr());
-
-        // 判断字段类型
-        org.example.utils.FieldLineage.FieldType fieldType = determineFieldType(oldLineage);
-        newLineage.setFieldType(fieldType);
-
-        // 如果有元数据，可以设置更多信息
-        if (fieldSchema != null) {
-            // 可以在这里添加元数据相关的处理
-        }
-
-        // 创建源字段依赖
-        if (oldLineage.getSourceTable() != null && oldLineage.getSourceField() != null) {
-            org.example.utils.FieldLineage sourceField = new org.example.utils.FieldLineage();
-            sourceField.setFieldName(oldLineage.getSourceField());
-            sourceField.setTableName(oldLineage.getSourceTable());
-            sourceField.setSourceTableName(oldLineage.getSourceTable());
-            sourceField.setFieldType(org.example.utils.FieldLineage.FieldType.COLUMN);
-            newLineage.getDependencies().add(sourceField);
-        }
-
-        return newLineage;
-    }
-
-    /**
-     * 根据血缘信息判断字段类型
-     */
-    private org.example.utils.FieldLineage.FieldType determineFieldType(HiveLineageParser.FieldLineage lineage) {
-        String expression = lineage.getTransformExpr();
-        String sourceField = lineage.getSourceField();
-        String targetField = lineage.getTargetField();
-
-        // 如果目标字段和源字段不同，说明是别名或计算字段
-        if (!targetField.equals(sourceField) && sourceField != null && !sourceField.isEmpty()) {
-            // 如果表达式包含函数或操作符，是计算字段
-            if (expression != null && (expression.contains("(") || expression.contains("+") ||
-                expression.contains("-") || expression.contains("*") || expression.contains("/") ||
-                expression.contains("CASE"))) {
-                return org.example.utils.FieldLineage.FieldType.CALCULATED;
-            }
-            return org.example.utils.FieldLineage.FieldType.ALIAS;
-        }
-
-        // 如果表达式为空或就是字段名本身，是普通列
-        if (expression == null || expression.equals(targetField)) {
-            return org.example.utils.FieldLineage.FieldType.COLUMN;
-        }
-
-        // 如果包含聚合函数，是聚合字段
-        if (expression != null) {
-            String upperExpr = expression.toUpperCase();
-            if (upperExpr.contains("COUNT(") || upperExpr.contains("SUM(") ||
-                upperExpr.contains("AVG(") || upperExpr.contains("MIN(") ||
-                upperExpr.contains("MAX(") || upperExpr.contains("GROUP_CONCAT(")) {
-                return org.example.utils.FieldLineage.FieldType.AGGREGATE;
-            }
-
-            // 窗口函数
-            if (upperExpr.contains("OVER(")) {
-                return org.example.utils.FieldLineage.FieldType.WINDOW_FUNCTION;
-            }
-
-            // 其他情况视为计算字段
-            if (expression.contains("(") || expression.matches(".*[+\\-*/].*")) {
-                return org.example.utils.FieldLineage.FieldType.CALCULATED;
-            }
-        }
-
-        return org.example.utils.FieldLineage.FieldType.COLUMN;
-    }
-
-    /**
      * 获取所有源字段的集合（与 LogicalPlanLineageParser 的方法签名一致）
      *
      * @param fieldLineages 字段血缘映射
      * @return 字段全名 -> 源字段集合
      */
-    public static Map<String, Set<String>> getAllSourceFields(Map<String, org.example.utils.FieldLineage> fieldLineages) {
+    public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> fieldLineages) {
         Map<String, Set<String>> result = new HashMap<>();
 
-        for (Map.Entry<String, org.example.utils.FieldLineage> entry : fieldLineages.entrySet()) {
+        for (Map.Entry<String, FieldLineage> entry : fieldLineages.entrySet()) {
             String fieldName = entry.getKey();
-            org.example.utils.FieldLineage lineage = entry.getValue();
+            FieldLineage lineage = entry.getValue();
 
             // 获取该字段的所有源头字段
             Set<String> sourceFields = lineage.getAllSourceFields();

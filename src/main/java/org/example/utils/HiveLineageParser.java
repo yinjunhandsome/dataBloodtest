@@ -15,37 +15,6 @@ import java.util.Set;
 public class HiveLineageParser {
 
     /**
-     * 字段血缘信息类
-     */
-    public static class FieldLineage {
-        protected String targetTable;
-        protected String targetField;
-        protected String sourceTable;
-        protected String sourceField;
-        protected String transformExpr;
-
-        public FieldLineage(String targetTable, String targetField, String sourceTable, String sourceField, String transformExpr) {
-            this.targetTable = targetTable;
-            this.targetField = targetField;
-            this.sourceTable = sourceTable;
-            this.sourceField = sourceField;
-            this.transformExpr = transformExpr;
-        }
-
-        @Override
-        public String toString() {
-            return String.format("%s.%s <- %s.%s (expression: %s)",
-                targetTable, targetField, sourceTable, sourceField, transformExpr);
-        }
-
-        public String getTargetTable() { return targetTable; }
-        public String getTargetField() { return targetField; }
-        public String getSourceTable() { return sourceTable; }
-        public String getSourceField() { return sourceField; }
-        public String getTransformExpr() { return transformExpr; }
-    }
-
-    /**
      * SQL 解析结果类
      */
     public static class ParseResult {
@@ -69,7 +38,7 @@ public class HiveLineageParser {
             sb.append("Source Tables: ").append(sourceTables).append("\n");
             sb.append("Field Lineages:\n");
             for (FieldLineage lineage : fieldLineages) {
-                sb.append("  ").append(lineage).append("\n");
+                sb.append("  ").append(lineage.getLineageDescription()).append("\n");
             }
             return sb.toString();
         }
@@ -339,15 +308,71 @@ public class HiveLineageParser {
         // 提取字段引用
         Set<FieldReference> sourceFields = extractFieldReferencesFromParts(expressionParts, tableAliasMap);
 
+        // 创建目标字段血缘
+        FieldLineage targetFieldLineage = new FieldLineage();
+        targetFieldLineage.setFieldName(targetField);
+        targetFieldLineage.setTableName(targetTable);
+        targetFieldLineage.setExpression(expression);
+        targetFieldLineage.setFieldType(determineFieldType(expression, sourceFields));
+
+        // 添加依赖字段
         for (FieldReference sourceField : sourceFields) {
-            lineages.add(new FieldLineage(
-                targetTable,
-                targetField,
-                sourceField.table,
-                sourceField.field,
-                expression
-            ));
+            FieldLineage dependency = new FieldLineage();
+            dependency.setFieldName(sourceField.field);
+            dependency.setTableName(sourceField.table);
+            dependency.setSourceTableName(sourceField.table);
+            dependency.setFieldType(FieldLineage.FieldType.COLUMN);
+            targetFieldLineage.addDependency(dependency);
         }
+
+        lineages.add(targetFieldLineage);
+    }
+
+    /**
+     * 根据表达式和源字段确定字段类型
+     */
+    private static FieldLineage.FieldType determineFieldType(String expression, Set<FieldReference> sourceFields) {
+        if (sourceFields.isEmpty()) {
+            return FieldLineage.FieldType.LITERAL;
+        }
+
+        if (expression == null || expression.isEmpty()) {
+            return FieldLineage.FieldType.COLUMN;
+        }
+
+        String upperExpr = expression.toUpperCase();
+
+        // 检查聚合函数
+        if (upperExpr.contains("COUNT(") || upperExpr.contains("SUM(") ||
+            upperExpr.contains("AVG(") || upperExpr.contains("MIN(") ||
+            upperExpr.contains("MAX(") || upperExpr.contains("GROUP_CONCAT(")) {
+            return FieldLineage.FieldType.AGGREGATE;
+        }
+
+        // 检查窗口函数
+        if (upperExpr.contains("OVER(")) {
+            return FieldLineage.FieldType.WINDOW_FUNCTION;
+        }
+
+        // 检查 CASE WHEN
+        if (upperExpr.contains("CASE")) {
+            return FieldLineage.FieldType.CALCULATED;
+        }
+
+        // 检查是否有运算符
+        if (expression.matches(".*[+\\-*/%=<>!&|^~].*")) {
+            return FieldLineage.FieldType.CALCULATED;
+        }
+
+        // 检查是否是简单字段引用
+        if (sourceFields.size() == 1) {
+            FieldReference ref = sourceFields.iterator().next();
+            if (expression.equals(ref.table + "." + ref.field) || expression.equals(ref.field)) {
+                return FieldLineage.FieldType.COLUMN;
+            }
+        }
+
+        return FieldLineage.FieldType.ALIAS;
     }
 
     /**
