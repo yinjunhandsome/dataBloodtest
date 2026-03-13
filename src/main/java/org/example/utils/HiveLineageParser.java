@@ -1,33 +1,52 @@
 package org.example.utils;
 
+import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.hadoop.hive.ql.metadata.Hive;
+import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.parse.ASTNode;
 import org.apache.hadoop.hive.ql.parse.ParseDriver;
 import org.apache.hadoop.hive.ql.parse.ParseException;
 import org.apache.hadoop.hive.ql.lib.Node;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * Hive SQL 字段血缘解析器
+ * 基于 Hive Metastore 的字段级别血缘解析，支持绑定元数据验证字段存在性
+ */
 public class HiveLineageParser {
+
+    private HiveConf hiveConf;
+    private HiveMetaStoreClient metaStoreClient;
+    private boolean connected = false;
 
     /**
      * SQL 解析结果类
      */
     public static class ParseResult {
-        protected String sqlType;
-        protected String targetTable;
-        protected List<FieldLineage> fieldLineages;
-        protected Set<String> sourceTables;
+        private String sqlType;
+        private String targetTable;
+        private Map<String, FieldLineage> fieldLineages;
+        private Set<String> sourceTables;
+        private boolean validated;
 
-        public ParseResult(String sqlType, String targetTable, List<FieldLineage> fieldLineages, Set<String> sourceTables) {
+        public ParseResult(String sqlType, String targetTable,
+                          Map<String, FieldLineage> fieldLineages,
+                          Set<String> sourceTables, boolean validated) {
             this.sqlType = sqlType;
             this.targetTable = targetTable;
             this.fieldLineages = fieldLineages;
             this.sourceTables = sourceTables;
+            this.validated = validated;
         }
 
         @Override
@@ -36,33 +55,151 @@ public class HiveLineageParser {
             sb.append("SQL Type: ").append(sqlType).append("\n");
             sb.append("Target Table: ").append(targetTable).append("\n");
             sb.append("Source Tables: ").append(sourceTables).append("\n");
+            sb.append("Validated: ").append(validated ? "Yes" : "No").append("\n");
             sb.append("Field Lineages:\n");
-            for (FieldLineage lineage : fieldLineages) {
-                sb.append("  ").append(lineage.getLineageDescription()).append("\n");
+            for (Map.Entry<String, FieldLineage> entry : fieldLineages.entrySet()) {
+                sb.append("  ").append(entry.getKey()).append(":\n");
+                sb.append("    ").append(entry.getValue().getLineageDescription());
             }
             return sb.toString();
         }
 
         public String getSqlType() { return sqlType; }
         public String getTargetTable() { return targetTable; }
-        public List<FieldLineage> getFieldLineages() { return fieldLineages; }
+        public Map<String, FieldLineage> getFieldLineagesMap() { return fieldLineages; }
+        public Collection<FieldLineage> getFieldLineages() { return fieldLineages.values(); }
         public Set<String> getSourceTables() { return sourceTables; }
+        public boolean isValidated() { return validated; }
     }
 
     /**
-     * 解析 Hive SQL 并返回字段级别血缘关系
+     * 连接到 Hive Metastore
+     *
+     * @param metastoreUrl Metastore URIs，例如：thrift://localhost:9083
+     * @throws Exception 连接失败时抛出
+     */
+    public void connect(String metastoreUrl) throws Exception {
+        hiveConf = new HiveConf();
+        hiveConf.set("hive.metastore.uris", metastoreUrl);
+        hiveConf.setBoolean("hive.support.quoted.identifiers", true);
+        hiveConf.setBoolean("hive.semantic.analyzer.execute", false);
+
+        try {
+            metaStoreClient = new HiveMetaStoreClient(hiveConf);
+            connected = true;
+            System.out.println("Successfully connected to Hive Metastore: " + metastoreUrl);
+        } catch (Exception e) {
+            connected = false;
+            throw new Exception("Failed to connect to Hive Metastore: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 使用本地 Hive 实例连接（用于测试或本地模式）
+     */
+    public void connectLocal() throws Exception {
+        try {
+            Hive hive = Hive.get();
+            hiveConf = hive.getConf();
+            connected = true;
+            System.out.println("Connected to local Hive instance");
+        } catch (HiveException e) {
+            throw new Exception("Failed to connect to local Hive: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 断开连接
+     */
+    public void disconnect() {
+        if (metaStoreClient != null) {
+            metaStoreClient.close();
+            metaStoreClient = null;
+        }
+        connected = false;
+    }
+
+    /**
+     * 检查是否已连接
+     */
+    public boolean isConnected() {
+        return connected && metaStoreClient != null;
+    }
+
+    /**
+     * 获取表的字段信息
+     *
+     * @param tableName 表名，格式：database.table 或 table
+     * @return 字段名到字段信息的映射
+     */
+    public Map<String, FieldSchema> getTableFields(String tableName) throws Exception {
+        if (!isConnected()) {
+            throw new IllegalStateException("Not connected to Metastore");
+        }
+
+        try {
+            String dbName = "default";
+            String tblName = tableName;
+
+            if (tableName.contains(".")) {
+                String[] parts = tableName.split("\\.", 2);
+                dbName = parts[0];
+                tblName = parts[1];
+            }
+
+            Table table = metaStoreClient.getTable(dbName, tblName);
+            if (table == null) {
+                throw new IllegalArgumentException("Table not found: " + tableName);
+            }
+
+            Map<String, FieldSchema> fields = new HashMap<>();
+            for (FieldSchema field : table.getSd().getCols()) {
+                fields.put(field.getName(), field);
+            }
+
+            if (table.getPartitionKeys() != null) {
+                for (FieldSchema field : table.getPartitionKeys()) {
+                    fields.put(field.getName(), field);
+                }
+            }
+
+            return fields;
+        } catch (Exception e) {
+            throw new Exception("Failed to get fields for table " + tableName + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 验证字段是否存在
+     *
+     * @param tableName 表名
+     * @param fieldName 字段名
+     * @return 字段信息，如果不存在返回 null
+     */
+    public FieldSchema validateField(String tableName, String fieldName) throws Exception {
+        Map<String, FieldSchema> fields = getTableFields(tableName);
+        return fields.get(fieldName);
+    }
+
+    /**
+     * 解析 Hive SQL 并返回字段级别血缘关系（必须连接元数据）
      *
      * @param sql Hive SQL 语句
      * @return ParseResult 包含字段血缘信息的解析结果
+     * @throws IllegalStateException 如果未连接到 Metastore
      */
-    public static ParseResult parseFieldLineage(String sql) throws ParseException {
+    public ParseResult parseFieldLineage(String sql) throws ParseException, Exception {
+        if (!isConnected()) {
+            throw new IllegalStateException("必须先连接到 Hive Metastore 才能进行解析。请调用 connect() 方法。");
+        }
+
         // 预处理SQL：处理反引号引用的标识符
         String processedSql = preprocessSql(sql);
 
         ParseDriver parseDriver = new ParseDriver();
         ASTNode astTree = parseDriver.parse(processedSql);
 
-        // 获取 SQL 类型 - 根节点的 token 可能为 null，需要从子节点获取
+        // 获取 SQL 类型
         String sqlType = "UNKNOWN";
         List<? extends Node> children = astTree.getChildren();
         if (children != null && !children.isEmpty()) {
@@ -74,7 +211,7 @@ public class HiveLineageParser {
         }
 
         String targetTable = null;
-        List<FieldLineage> fieldLineages = new ArrayList<>();
+        List<FieldLineage> fieldLineagesList = new ArrayList<>();
         Set<String> sourceTables = new HashSet<>();
 
         // 根据 SQL 类型处理
@@ -83,10 +220,9 @@ public class HiveLineageParser {
             case "TOK_CREATE_TABLE":
                 targetTable = extractTargetTable(astTree);
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable);
+                fieldLineagesList = extractFieldLineages(astTree, targetTable);
                 break;
             case "TOK_QUERY":
-                // TOK_QUERY 可能包含 INSERT_INTO 或只是普通查询
                 ASTNode insertIntoNode = findNode(astTree, "TOK_INSERT_INTO");
                 if (insertIntoNode != null) {
                     targetTable = extractInsertTargetTable(astTree);
@@ -94,59 +230,94 @@ public class HiveLineageParser {
                     targetTable = "QUERY_RESULT";
                 }
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable);
+                fieldLineagesList = extractFieldLineages(astTree, targetTable);
                 break;
             case "TOK_INSERT":
                 targetTable = extractInsertTargetTable(astTree);
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable);
+                fieldLineagesList = extractFieldLineages(astTree, targetTable);
                 break;
             case "TOK_UNION":
-                // UNION 语句
                 targetTable = "UNION_RESULT";
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable);
+                fieldLineagesList = extractFieldLineages(astTree, targetTable);
                 break;
-            case "TOK_WITH_CLAUSE":  // CTE (WITH clause)
+            case "TOK_WITH_CLAUSE":
             case "TOK_CTE":
                 targetTable = "CTE_RESULT";
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable);
-                break;
-            case "TOK_ALTERTABLE":
-            case "TOK_ALTERVIEW":
-            case "TOK_DROP_TABLE":
-            case "TOK_TRUNCATE_TABLE":
-            case "TOK_DELETED":
-            case "TOK_UPDATED":
-                // DDL 和 DML 操作，只提取源表
-                sourceTables = extractSourceTables(astTree);
-                targetTable = "DML_OPERATION";
-                fieldLineages = extractFieldLineages(astTree, targetTable);
+                fieldLineagesList = extractFieldLineages(astTree, targetTable);
                 break;
             default:
-                // 其他 SQL 类型，尝试直接处理
                 sourceTables = extractSourceTables(astTree);
-                fieldLineages = extractFieldLineages(astTree, targetTable != null ? targetTable : "UNKNOWN");
+                fieldLineagesList = extractFieldLineages(astTree, targetTable != null ? targetTable : "UNKNOWN");
                 break;
         }
 
-        // 同时提取 JOIN 信息
         extractJoinInformation(astTree, sourceTables);
 
-        return new ParseResult(sqlType, targetTable, fieldLineages, sourceTables);
+        // 转换为 Map 格式并验证元数据
+        Map<String, FieldLineage> fieldLineages = new HashMap<>();
+        boolean allValidated = true;
+
+        for (FieldLineage lineage : fieldLineagesList) {
+            try {
+                // 验证依赖字段
+                for (FieldLineage dependency : lineage.getDependencies()) {
+                    FieldSchema sourceFieldSchema = validateField(
+                        dependency.getTableName(),
+                        dependency.getFieldName()
+                    );
+                    if (sourceFieldSchema == null) {
+                        allValidated = false;
+                        System.out.println("Warning: Source field not found in Metastore: " +
+                            dependency.getTableName() + "." + dependency.getFieldName());
+                    }
+                }
+                fieldLineages.put(lineage.getFieldName(), lineage);
+            } catch (Exception e) {
+                allValidated = false;
+                System.err.println("Error validating field " + lineage.getTableName() + "." +
+                    lineage.getFieldName() + ": " + e.getMessage());
+                lineage.setFieldType(FieldLineage.FieldType.ERROR);
+                fieldLineages.put(lineage.getFieldName(), lineage);
+            }
+        }
+
+        return new ParseResult(sqlType, targetTable, fieldLineages, sourceTables, allValidated);
     }
 
     /**
-     * 提取目标表名（CREATE TABLE AS）
+     * 获取所有源字段的集合
+     *
+     * @param fieldLineages 字段血缘映射
+     * @return 字段全名 -> 源字段集合
      */
+    public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> fieldLineages) {
+        Map<String, Set<String>> result = new HashMap<>();
+
+        for (Map.Entry<String, FieldLineage> entry : fieldLineages.entrySet()) {
+            String fieldName = entry.getKey();
+            FieldLineage lineage = entry.getValue();
+
+            Set<String> sourceFields = lineage.getAllSourceFields();
+
+            String fullName = lineage.getTableName() != null ?
+                lineage.getTableName() + "." + fieldName : fieldName;
+
+            result.put(fullName, sourceFields);
+        }
+
+        return result;
+    }
+
+    // ==================== 私有辅助方法 ====================
+
     private static String extractTargetTable(ASTNode astTree) {
-        // 使用列表来保存找到的表名，lambda 可以访问 final 的容器
         List<String> tableNameList = new ArrayList<>();
         findNode(astTree, "TOK_TABNAME", node -> {
             if (tableNameList.isEmpty()) {
                 ASTNode tabNameNode = (ASTNode) node;
-                // 通常第一个 TOK_TABNAME 是目标表
                 if (tabNameNode.getChildCount() > 0) {
                     StringBuilder sb = new StringBuilder();
                     for (int i = 0; i < tabNameNode.getChildCount(); i++) {
@@ -160,14 +331,10 @@ public class HiveLineageParser {
         return tableNameList.isEmpty() ? "UNKNOWN" : tableNameList.get(0);
     }
 
-    /**
-     * 提取 INSERT 目标表名
-     */
     private static String extractInsertTargetTable(ASTNode astTree) {
         String tableName = "UNKNOWN";
         ASTNode insertNode = findNode(astTree, "TOK_INSERT_INTO");
         if (insertNode != null && insertNode.getChildCount() > 0) {
-            // TOK_INSERT_INTO 的结构: (TOK_INSERT_INTO (TOK_TAB (TOK_TABNAME table_name)))
             Object child = insertNode.getChild(0);
             if (child instanceof ASTNode) {
                 ASTNode tabNode = (ASTNode) child;
@@ -187,9 +354,6 @@ public class HiveLineageParser {
         return tableName;
     }
 
-    /**
-     * 提取源表集合
-     */
     private static Set<String> extractSourceTables(ASTNode astTree) {
         Set<String> tables = new HashSet<>();
         findNode(astTree, "TOK_TABREF", node -> {
@@ -210,14 +374,10 @@ public class HiveLineageParser {
         return tables;
     }
 
-    /**
-     * 提取字段级别血缘关系
-     */
     private static List<FieldLineage> extractFieldLineages(ASTNode astTree, String targetTable) {
         List<FieldLineage> lineages = new ArrayList<>();
         Map<String, String> tableAliasMap = buildTableAliasMap(astTree);
 
-        // 查找 SELECT 子句中的字段
         ASTNode selectNode = findNode(astTree, "TOK_SELECT");
         if (selectNode != null) {
             for (int i = 0; i < selectNode.getChildCount(); i++) {
@@ -235,14 +395,10 @@ public class HiveLineageParser {
         return lineages;
     }
 
-    /**
-     * 构建表别名映射
-     */
     private static Map<String, String> buildTableAliasMap(ASTNode astTree) {
         Map<String, String> aliasMap = new HashMap<>();
         findNode(astTree, "TOK_TABREF", node -> {
             ASTNode tabRefNode = (ASTNode) node;
-            // TOK_TABREF 的结构通常是: (TOK_TABREF (TOK_TABNAME db table) alias)
             if (tabRefNode.getChildCount() >= 2) {
                 Object child0 = tabRefNode.getChild(0);
                 if (child0 instanceof ASTNode) {
@@ -266,7 +422,6 @@ public class HiveLineageParser {
                         if (i > 0) fullName.append(".");
                         fullName.append(tabNameNode.getChild(i).toString());
                     }
-                    // 使用表名本身作为别名
                     String tableName = fullName.toString();
                     aliasMap.put(tableName, tableName);
                 }
@@ -275,13 +430,9 @@ public class HiveLineageParser {
         return aliasMap;
     }
 
-    /**
-     * 处理 SELECT 表达式节点
-     */
     private static void processSelectExpr(ASTNode selExprNode, String targetTable,
                                         Map<String, String> tableAliasMap,
                                         List<FieldLineage> lineages) {
-        // TOK_SELEXPR 的结构: (TOK_SELEXPR expression alias?)
         String alias = null;
         List<Object> expressionParts = new ArrayList<>();
 
@@ -289,7 +440,6 @@ public class HiveLineageParser {
             Object child = selExprNode.getChild(i);
             if (i == selExprNode.getChildCount() - 1 && child instanceof ASTNode) {
                 ASTNode childNode = (ASTNode) child;
-                // 检查是否是别名（通常是简单的标识符）
                 String childText = childNode.getToken() != null ? childNode.getToken().getText() : "";
                 if (childNode.getChildCount() == 0 &&
                     !childText.startsWith("TOK_") &&
@@ -301,21 +451,17 @@ public class HiveLineageParser {
             expressionParts.add(child);
         }
 
-        // 构建表达式字符串和目标字段名
         String expression = buildExpressionString(expressionParts);
         String targetField = alias != null ? alias : (expression.isEmpty() ? "UNKNOWN" : expression);
 
-        // 提取字段引用
         Set<FieldReference> sourceFields = extractFieldReferencesFromParts(expressionParts, tableAliasMap);
 
-        // 创建目标字段血缘
         FieldLineage targetFieldLineage = new FieldLineage();
         targetFieldLineage.setFieldName(targetField);
         targetFieldLineage.setTableName(targetTable);
         targetFieldLineage.setExpression(expression);
         targetFieldLineage.setFieldType(determineFieldType(expression, sourceFields));
 
-        // 添加依赖字段
         for (FieldReference sourceField : sourceFields) {
             FieldLineage dependency = new FieldLineage();
             dependency.setFieldName(sourceField.field);
@@ -328,9 +474,6 @@ public class HiveLineageParser {
         lineages.add(targetFieldLineage);
     }
 
-    /**
-     * 根据表达式和源字段确定字段类型
-     */
     private static FieldLineage.FieldType determineFieldType(String expression, Set<FieldReference> sourceFields) {
         if (sourceFields.isEmpty()) {
             return FieldLineage.FieldType.LITERAL;
@@ -342,29 +485,24 @@ public class HiveLineageParser {
 
         String upperExpr = expression.toUpperCase();
 
-        // 检查聚合函数
         if (upperExpr.contains("COUNT(") || upperExpr.contains("SUM(") ||
             upperExpr.contains("AVG(") || upperExpr.contains("MIN(") ||
             upperExpr.contains("MAX(") || upperExpr.contains("GROUP_CONCAT(")) {
             return FieldLineage.FieldType.AGGREGATE;
         }
 
-        // 检查窗口函数
         if (upperExpr.contains("OVER(")) {
             return FieldLineage.FieldType.WINDOW_FUNCTION;
         }
 
-        // 检查 CASE WHEN
         if (upperExpr.contains("CASE")) {
             return FieldLineage.FieldType.CALCULATED;
         }
 
-        // 检查是否有运算符
         if (expression.matches(".*[+\\-*/%=<>!&|^~].*")) {
             return FieldLineage.FieldType.CALCULATED;
         }
 
-        // 检查是否是简单字段引用
         if (sourceFields.size() == 1) {
             FieldReference ref = sourceFields.iterator().next();
             if (expression.equals(ref.table + "." + ref.field) || expression.equals(ref.field)) {
@@ -375,9 +513,6 @@ public class HiveLineageParser {
         return FieldLineage.FieldType.ALIAS;
     }
 
-    /**
-     * 从表达式部分构建字符串
-     */
     private static String buildExpressionString(List<Object> parts) {
         StringBuilder sb = new StringBuilder();
         for (Object part : parts) {
@@ -385,7 +520,6 @@ public class HiveLineageParser {
                 ASTNode node = (ASTNode) part;
                 String tokenText = node.getToken() != null ? node.getToken().getText() : "";
                 if (".".equals(tokenText)) {
-                    // 处理点操作符 - 构建 table.field 格式
                     if (node.getChildCount() >= 2) {
                         Object left = node.getChild(0);
                         Object right = node.getChild(1);
@@ -394,18 +528,14 @@ public class HiveLineageParser {
                         sb.append(leftStr).append(".").append(rightStr);
                     }
                 } else if ("TOK_TABLE_OR_COL".equals(tokenText)) {
-                    // 简单列引用
                     if (node.getChildCount() > 0) {
                         sb.append(node.getChild(0).toString());
                     }
                 } else if ("*".equals(tokenText) || "+".equals(tokenText) || "-".equals(tokenText)) {
-                    // 算术操作符
                     sb.append(" ").append(tokenText).append(" ");
                 } else if ("TOK_FUNCTIONSTAR".equals(tokenText)) {
-                    // count(*) 这样的函数
                     sb.append(tokenText.replace("TOK_", "").toLowerCase()).append("(*)");
                 } else if (!tokenText.startsWith("TOK_")) {
-                    // 字面值
                     sb.append(node.toString());
                 }
             } else {
@@ -415,9 +545,6 @@ public class HiveLineageParser {
         return sb.toString().trim();
     }
 
-    /**
-     * 获取节点文本
-     */
     private static String getNodeText(Object node) {
         if (node instanceof ASTNode) {
             ASTNode astNode = (ASTNode) node;
@@ -430,9 +557,6 @@ public class HiveLineageParser {
         return node.toString();
     }
 
-    /**
-     * 从表达式部分提取字段引用
-     */
     private static Set<FieldReference> extractFieldReferencesFromParts(List<Object> parts, Map<String, String> tableAliasMap) {
         Set<FieldReference> references = new HashSet<>();
         for (Object part : parts) {
@@ -443,9 +567,6 @@ public class HiveLineageParser {
         return references;
     }
 
-    /**
-     * 从单个节点提取字段引用（增强版，支持更多算子）
-     */
     private static void extractFieldReferencesFromNode(ASTNode node, Map<String, String> tableAliasMap, Set<FieldReference> references) {
         if (node == null) {
             return;
@@ -453,7 +574,6 @@ public class HiveLineageParser {
 
         String tokenText = node.getToken() != null ? node.getToken().getText() : "";
 
-        // 处理点操作符 - table.field (这是最主要的字段引用方式)
         if (".".equals(tokenText) && node.getChildCount() >= 2) {
             String qualifier = null;
             String identifier;
@@ -461,7 +581,6 @@ public class HiveLineageParser {
             Object left = node.getChild(0);
             Object right = node.getChild(1);
 
-            // 左边可能是表别名
             if (left instanceof ASTNode) {
                 ASTNode leftNode = (ASTNode) left;
                 String leftToken = leftNode.getToken() != null ? leftNode.getToken().getText() : "";
@@ -470,36 +589,28 @@ public class HiveLineageParser {
                 }
             }
 
-            // 右边是字段名
             identifier = getNodeText(right);
 
             if (identifier != null) {
                 String table = qualifier != null ? tableAliasMap.getOrDefault(qualifier, qualifier) : "UNKNOWN";
-                // 只有成功解析到表别名时才添加
                 if (!"UNKNOWN".equals(table)) {
                     references.add(new FieldReference(table, identifier));
                 }
             }
-            // 点操作符已经处理了，不需要继续递归
             return;
         }
 
-        // 处理 TOK_TABLE_OR_COL - 简单字段引用（没有表别名的情况）
         if ("TOK_TABLE_OR_COL".equals(tokenText) && node.getChildCount() > 0) {
             String identifier = node.getChild(0).toString();
-            // 对于没有表别名的字段，尝试从表别名映射中推断
-            // 如果只有一个源表，可以使用它
             if (tableAliasMap.size() == 1) {
                 String table = tableAliasMap.values().iterator().next();
                 references.add(new FieldReference(table, identifier));
             } else {
                 references.add(new FieldReference("UNKNOWN", identifier));
             }
-            // TOK_TABLE_OR_COL 已经处理了，不需要继续递归
             return;
         }
 
-        // 处理 TOK_ALLCOLREF - table.* 引用
         if ("TOK_ALLCOLREF".equals(tokenText)) {
             if (node.getChildCount() > 0) {
                 Object child = node.getChild(0);
@@ -508,7 +619,6 @@ public class HiveLineageParser {
                     String qualifier = childNode.getText();
                     String table = tableAliasMap.getOrDefault(qualifier, qualifier);
                     if (!"UNKNOWN".equals(table)) {
-                        // 添加一个特殊的引用表示所有列
                         references.add(new FieldReference(table, "*"));
                     }
                 }
@@ -516,13 +626,11 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理函数调用 - 递归提取函数参数中的字段引用
         if ("TOK_FUNCTION".equals(tokenText) || "TOK_FUNCTIONSTAR".equals(tokenText) ||
             "TOK_FUNCTIONDI".equals(tokenText) || "TOK_FUNCTIONNZ".equals(tokenText)) {
-            // 递归处理函数参数
             List<? extends Node> children = node.getChildren();
             if (children != null) {
-                for (int i = 1; i < children.size(); i++) {  // 跳过函数名
+                for (int i = 1; i < children.size(); i++) {
                     if (children.get(i) instanceof ASTNode) {
                         extractFieldReferencesFromNode((ASTNode) children.get(i), tableAliasMap, references);
                     }
@@ -531,7 +639,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 CASE WHEN 表达式 - 递归提取 WHEN 和 ELSE 部分的字段引用
         if ("TOK_CASE_EXPR".equals(tokenText)) {
             List<? extends Node> children = node.getChildren();
             if (children != null) {
@@ -539,7 +646,6 @@ public class HiveLineageParser {
                     if (child instanceof ASTNode) {
                         ASTNode childNode = (ASTNode) child;
                         String childType = childNode.getToken() != null ? childNode.getToken().getText() : "";
-                        // 递归处理 TOK_WHEN 和 TOK_ELSE 节点
                         if ("TOK_WHEN".equals(childType) || "TOK_ELSE".equals(childType)) {
                             extractFieldReferencesFromNode(childNode, tableAliasMap, references);
                         }
@@ -549,7 +655,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 CAST 表达式 - 递归提取被转换的表达式
         if ("TOK_CAST".equals(tokenText)) {
             if (node.getChildCount() > 0) {
                 Object child = node.getChild(0);
@@ -560,16 +665,12 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理子查询 - 递归提取
         if ("TOK_SUBQUERY".equals(tokenText) || "TOK_QUERY".equals(tokenText)) {
-            // 子查询有自己的字段引用，可以递归处理
             extractFieldReferencesFromNode(node, tableAliasMap, references);
             return;
         }
 
-        // 处理聚合函数中的 DISTINCT
         if ("TOK_DI".equals(tokenText) || "TOK_ALL".equals(tokenText)) {
-            // 递归处理 DISTINCT 后面的表达式
             List<? extends Node> children = node.getChildren();
             if (children != null) {
                 for (Node child : children) {
@@ -581,7 +682,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理算术和逻辑运算符 - 递归处理操作数
         if (isOperator(tokenText)) {
             List<? extends Node> children = node.getChildren();
             if (children != null) {
@@ -594,7 +694,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 IS NULL / IS NOT NULL
         if ("TOK_IS_NULL".equals(tokenText) || "TOK_IS_NOT_NULL".equals(tokenText)) {
             if (node.getChildCount() > 0) {
                 Object child = node.getChild(0);
@@ -605,7 +704,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 IN 子查询 / EXISTS 子查询
         if ("TOK_IN".equals(tokenText) || "TOK_NOT_IN".equals(tokenText) ||
             "TOK_EXISTS".equals(tokenText) || "TOK_NOT_EXISTS".equals(tokenText)) {
             List<? extends Node> children = node.getChildren();
@@ -619,7 +717,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 BETWEEN 操作符
         if ("TOK_BETWEEN".equals(tokenText)) {
             List<? extends Node> children = node.getChildren();
             if (children != null) {
@@ -632,7 +729,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 处理 LIKE / RLIKE
         if ("TOK_LIKE".equals(tokenText) || "TOK_RLIKE".equals(tokenText)) {
             List<? extends Node> children = node.getChildren();
             if (children != null) {
@@ -645,7 +741,6 @@ public class HiveLineageParser {
             return;
         }
 
-        // 默认情况：递归处理子节点
         List<? extends Node> children = node.getChildren();
         if (children != null) {
             for (Node child : children) {
@@ -656,9 +751,6 @@ public class HiveLineageParser {
         }
     }
 
-    /**
-     * 字段引用类
-     */
     private static class FieldReference {
         String table;
         String field;
@@ -669,26 +761,18 @@ public class HiveLineageParser {
         }
     }
 
-    /**
-     * 检查是否是操作符
-     */
     private static boolean isOperator(String text) {
         return text.matches("[+\\-*/=<>!&|^~%]+");
     }
 
-    /**
-     * 查找指定类型的节点
-     */
     private static ASTNode findNode(ASTNode root, String nodeType) {
         if (root == null) {
             return null;
         }
-        // 使用 getToken().getText() 获取节点类型
         String currentType = root.getToken() != null ? root.getToken().getText() : "";
         if (nodeType.equals(currentType)) {
             return root;
         }
-        // 安全获取子节点列表
         List<? extends Node> children = root.getChildren();
         if (children != null) {
             for (Node child : children) {
@@ -703,19 +787,14 @@ public class HiveLineageParser {
         return null;
     }
 
-    /**
-     * 查找所有指定类型的节点并执行回调
-     */
     private static void findNode(ASTNode root, String nodeType, java.util.function.Consumer<Node> callback) {
         if (root == null) {
             return;
         }
-        // 使用 getToken().getText() 获取节点类型
         String currentType = root.getToken() != null ? root.getToken().getText() : "";
         if (nodeType.equals(currentType)) {
             callback.accept(root);
         }
-        // 安全获取子节点列表
         List<? extends Node> children = root.getChildren();
         if (children != null) {
             for (Node child : children) {
@@ -726,72 +805,7 @@ public class HiveLineageParser {
         }
     }
 
-    public static void main(String[] args) throws ParseException {
-        // 测试示例
-        String[] testSqls = {
-            "insert overwrite table hdp_teu_dpd_feature_db.hbg_user_action_log partition(dt = '${dateSuffix}') select imei, userid, pagetype, actiontype, wuxian_data from hdp_teu_dpd_wx_flow.dwd_wx_flow_58app_hbg_and_58local_action_view where dt = '${#date(0,0,-1):yyyyMMdd#}' and cate1 = '1' and actiontype in ('200000006713008400000100','200000006941031200000001','200000005529000100000100','200000005781000100000100')",
-            "CREATE TABLE result AS SELECT user_id, count(*) as cnt FROM source_table GROUP BY user_id",
-            "INSERT INTO target_table SELECT col1, col2 * 2 as double_col2 FROM source_table"
-        };
-
-        for (String sql : testSqls) {
-            System.out.println("========================================");
-            System.out.println("SQL: " + sql);
-            System.out.println("========================================");
-            try {
-                ParseResult result = parseFieldLineage(sql);
-                System.out.println(result);
-            } catch (Exception e) {
-                System.err.println("Error parsing SQL: " + e.getMessage());
-                e.printStackTrace();
-            }
-            System.out.println();
-        }
-    }
-
-    /**
-     * 打印 AST 树结构（用于调试）
-     */
-    private static void printAST(ASTNode node, int level) {
-        if (node == null) {
-            return;
-        }
-
-        StringBuilder indentBuilder = new StringBuilder();
-        for (int i = 0; i < level; i++) {
-            indentBuilder.append("  ");
-        }
-        String indent = indentBuilder.toString();
-
-        String tokenText = node.getToken() != null ? node.getToken().getText() : "null";
-        String nodeText = node.getText();
-        System.out.println(indent + "Token: " + tokenText + ", Text: '" + nodeText + "', Children: " + node.getChildCount());
-
-        List<? extends Node> children = node.getChildren();
-        if (children != null) {
-            for (Node child : children) {
-                if (child instanceof ASTNode) {
-                    printAST((ASTNode) child, level + 1);
-                } else {
-                    System.out.println(indent + "  Child: " + child);
-                }
-            }
-        }
-    }
-
-    /**
-     * 预处理 SQL 语句，处理反引号引用的标识符
-     *
-     * 对于包含特殊字符的标识符（如 call/uv），我们将：
-     * 1. 移除反引号
-     * 2. 将特殊字符替换为下划线，使其成为有效的标识符
-     *
-     * @param sql 原始 SQL 语句
-     * @return 预处理后的 SQL 语句
-     */
     private static String preprocessSql(String sql) {
-        // 处理反引号引用的标识符
-        // 策略：移除反引号，并将标识符中的特殊字符替换为下划线
         StringBuilder result = new StringBuilder();
         int length = sql.length();
         int i = 0;
@@ -800,8 +814,7 @@ public class HiveLineageParser {
             char c = sql.charAt(i);
 
             if (c == '`') {
-                // 找到反引号开始的位置，处理反引号内的内容
-                i++; // 跳过开始的反引号
+                i++;
                 StringBuilder identifier = new StringBuilder();
 
                 while (i < length && sql.charAt(i) != '`') {
@@ -809,12 +822,10 @@ public class HiveLineageParser {
                     i++;
                 }
 
-                // 跳过结束的反引号
                 if (i < length && sql.charAt(i) == '`') {
                     i++;
                 }
 
-                // 将标识符中的特殊字符替换为下划线
                 String normalizedIdentifier = normalizeIdentifier(identifier.toString());
                 result.append(normalizedIdentifier);
             } else {
@@ -826,15 +837,7 @@ public class HiveLineageParser {
         return result.toString();
     }
 
-    /**
-     * 规范化标识符，将特殊字符替换为下划线
-     *
-     * @param identifier 原始标识符
-     * @return 规范化后的标识符
-     */
     private static String normalizeIdentifier(String identifier) {
-        // 将非字母数字下划线的字符替换为下划线
-        // 保留字母、数字、下划线，其他字符都替换为下划线
         StringBuilder normalized = new StringBuilder();
         for (int i = 0; i < identifier.length(); i++) {
             char c = identifier.charAt(i);
@@ -847,36 +850,21 @@ public class HiveLineageParser {
         return normalized.toString();
     }
 
-    /**
-     * 提取 JOIN 信息，识别所有参与的表
-     * 支持: INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN, CROSS JOIN, SEMI JOIN
-     */
     private static void extractJoinInformation(ASTNode astTree, Set<String> sourceTables) {
-        // 查找所有类型的 JOIN
         String[] joinTypes = {
-            "TOK_JOIN",           // INNER JOIN
-            "TOK_LEFTJOIN",       // LEFT JOIN
-            "TOK_LEFTOUTERJOIN",  // LEFT OUTER JOIN
-            "TOK_RIGHTJOIN",      // RIGHT JOIN
-            "TOK_RIGHTOUTERJOIN", // RIGHT OUTER JOIN
-            "TOK_FULLOUTERJOIN",  // FULL OUTER JOIN
-            "TOK_CROSSJOIN",      // CROSS JOIN
-            "TOK_LEFTSEMIJOIN",   // LEFT SEMI JOIN (IN 子查询)
-            "TOK_LATERAL_VIEW",   // LATERAL VIEW
-            "TOK_LATERAL_VIEW_OUTER" // LATERAL VIEW OUTER
+            "TOK_JOIN", "TOK_LEFTJOIN", "TOK_LEFTOUTERJOIN",
+            "TOK_RIGHTJOIN", "TOK_RIGHTOUTERJOIN", "TOK_FULLOUTERJOIN",
+            "TOK_CROSSJOIN", "TOK_LEFTSEMIJOIN",
+            "TOK_LATERAL_VIEW", "TOK_LATERAL_VIEW_OUTER"
         };
 
         for (String joinType : joinTypes) {
             findNode(astTree, joinType, node -> {
-                // 从 JOIN 节点提取表引用
                 extractTablesFromNode((ASTNode) node, sourceTables);
             });
         }
     }
 
-    /**
-     * 从节点及其子节点递归提取表引用
-     */
     private static void extractTablesFromNode(ASTNode node, Set<String> sourceTables) {
         if (node == null) {
             return;
@@ -884,7 +872,6 @@ public class HiveLineageParser {
 
         String tokenText = node.getToken() != null ? node.getToken().getText() : "";
 
-        // 如果是表引用节点
         if ("TOK_TABREF".equals(tokenText)) {
             if (node.getChildCount() > 0) {
                 Object child = node.getChild(0);
@@ -898,10 +885,9 @@ public class HiveLineageParser {
                     sourceTables.add(sb.toString());
                 }
             }
-            return; // TOK_TABREF 已经处理，不需要继续递归
+            return;
         }
 
-        // 递归处理子节点
         List<? extends Node> children = node.getChildren();
         if (children != null) {
             for (Node child : children) {
@@ -913,170 +899,45 @@ public class HiveLineageParser {
     }
 
     /**
-     * 增强的表达式字符串构建，支持更多操作符
+     * 测试方法
      */
-    private static String buildExpressionStringEnhanced(List<Object> parts) {
-        StringBuilder sb = new StringBuilder();
-        for (Object part : parts) {
-            if (part instanceof ASTNode) {
-                ASTNode node = (ASTNode) part;
-                String tokenText = node.getToken() != null ? node.getToken().getText() : "";
+    public static void main(String[] args) {
+        HiveLineageParser parser = new HiveLineageParser();
 
-                if (".".equals(tokenText)) {
-                    // 处理点操作符 - 构建 table.field 格式
-                    if (node.getChildCount() >= 2) {
-                        Object left = node.getChild(0);
-                        Object right = node.getChild(1);
-                        String leftStr = getNodeText(left);
-                        String rightStr = getNodeText(right);
-                        sb.append(leftStr).append(".").append(rightStr);
+        String[] testSqls = {
+            "insert overwrite table hdp_teu_dpd_feature_db.hbg_user_action_log partition(dt = '${dateSuffix}') select imei, userid, pagetype, actiontype, wuxian_data from hdp_teu_dpd_wx_flow.dwd_wx_flow_58app_hbg_and_58local_action_view where dt = '${#date(0,0,-1):yyyyMMdd#}' and cate1 = '1' and actiontype in ('200000006713008400000100','200000006941031200000001','200000005529000100000100','200000005781000100000100')",
+            "CREATE TABLE result AS SELECT user_id, count(*) as cnt FROM source_table GROUP BY user_id",
+            "INSERT INTO target_table SELECT col1, col2 * 2 as double_col2 FROM source_table"
+        };
+
+        try {
+            // 连接到 Metastore
+            String metastoreUrl = "thrift://hdp-metastore-etl.58dns.org:9083";
+            parser.connect(metastoreUrl);
+
+            for (String sql : testSqls) {
+                System.out.println("========================================");
+                System.out.println("SQL: " + sql);
+                System.out.println("========================================");
+                try {
+                    ParseResult result = parser.parseFieldLineage(sql);
+                    System.out.println(result);
+
+                    System.out.println("Source Fields Mapping:");
+                    Map<String, Set<String>> sourceFieldsMap = getAllSourceFields(result.getFieldLineagesMap());
+                    for (Map.Entry<String, Set<String>> entry : sourceFieldsMap.entrySet()) {
+                        System.out.println("  " + entry.getKey() + " → " + entry.getValue());
                     }
-                } else if ("TOK_TABLE_OR_COL".equals(tokenText)) {
-                    // 简单列引用
-                    if (node.getChildCount() > 0) {
-                        sb.append(node.getChild(0).toString());
-                    }
-                } else if ("*".equals(tokenText) || "+".equals(tokenText) || "-".equals(tokenText) ||
-                           "*".equals(tokenText) || "/".equals(tokenText) || "%".equals(tokenText) ||
-                           "=".equals(tokenText) || "<".equals(tokenText) || ">".equals(tokenText) ||
-                           "<=".equals(tokenText) || ">=".equals(tokenText) || "<>".equals(tokenText) ||
-                           "&&".equals(tokenText) || "||".equals(tokenText) || "!".equals(tokenText)) {
-                    // 操作符
-                    sb.append(" ").append(tokenText).append(" ");
-                } else if ("TOK_FUNCTION".equals(tokenText) || "TOK_FUNCTIONSTAR".equals(tokenText)) {
-                    // 函数调用
-                    sb.append(buildFunctionString(node));
-                } else if ("TOK_CASE_EXPR".equals(tokenText)) {
-                    // CASE WHEN 表达式
-                    sb.append(buildCaseExpressionString(node));
-                } else if ("TOK_CAST".equals(tokenText)) {
-                    // CAST 表达式
-                    sb.append(buildCastExpressionString(node));
-                } else if ("TOK_IS_NULL".equals(tokenText) || "TOK_IS_NOT_NULL".equals(tokenText)) {
-                    // IS NULL / IS NOT NULL
-                    sb.append(tokenText.replace("TOK_", "").toLowerCase().replace("_", " "));
-                    if (node.getChildCount() > 0) {
-                        sb.append(" ").append(getNodeText(node.getChild(0)));
-                    }
-                } else if ("TOK_EXISTS".equals(tokenText) || "TOK_NOT_EXISTS".equals(tokenText)) {
-                    // EXISTS / NOT EXISTS (子查询)
-                    sb.append(tokenText.replace("TOK_", "").toLowerCase());
-                } else if ("TOK_SUBQUERY".equals(tokenText)) {
-                    // 子查询
-                    sb.append("(SELECT ...)");
-                } else if ("TOK_ALLCOLREF".equals(tokenText)) {
-                    // table.* 引用
-                    sb.append(buildAllColRefString(node));
-                } else if ("TOK_ANONYMOUS".equals(tokenText)) {
-                    // 匿名列
-                    // 跳过
-                } else if (!tokenText.startsWith("TOK_")) {
-                    // 字面值
-                    sb.append(node.toString());
+                } catch (Exception e) {
+                    System.err.println("Error: " + e.getMessage());
                 }
-            } else {
-                sb.append(part.toString());
+                System.out.println();
             }
+        } catch (Exception e) {
+            System.err.println("Failed to connect to Metastore: " + e.getMessage());
+            System.err.println("Please configure the correct Metastore URL.");
+        } finally {
+            parser.disconnect();
         }
-        return sb.toString().trim();
-    }
-
-    /**
-     * 构建函数调用字符串
-     */
-    private static String buildFunctionString(ASTNode functionNode) {
-        StringBuilder sb = new StringBuilder();
-        String tokenText = functionNode.getToken() != null ? functionNode.getToken().getText() : "";
-
-        if ("TOK_FUNCTIONSTAR".equals(tokenText)) {
-            // count(*) 这种情况
-            sb.append("count(*)");
-        } else if ("TOK_FUNCTION".equals(tokenText)) {
-            // 普通函数：function_name(args)
-            if (functionNode.getChildCount() > 0) {
-                // 第一个子节点通常是函数名
-                Object nameChild = functionNode.getChild(0);
-                if (nameChild instanceof ASTNode) {
-                    ASTNode nameNode = (ASTNode) nameChild;
-                    String functionName = nameNode.getText();
-                    sb.append(functionName).append("(");
-
-                    // 后续子节点是参数
-                    for (int i = 1; i < functionNode.getChildCount(); i++) {
-                        if (i > 1) sb.append(", ");
-                        sb.append(getNodeText(functionNode.getChild(i)));
-                    }
-
-                    sb.append(")");
-                }
-            }
-        }
-
-        return sb.toString();
-    }
-
-    /**
-     * 构建 CASE WHEN 表达式字符串
-     */
-    private static String buildCaseExpressionString(ASTNode caseNode) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("CASE ");
-
-        for (int i = 0; i < caseNode.getChildCount(); i++) {
-            Object child = caseNode.getChild(i);
-            if (child instanceof ASTNode) {
-                ASTNode childNode = (ASTNode) child;
-                String childType = childNode.getToken() != null ? childNode.getToken().getText() : "";
-
-                if ("TOK_WHEN".equals(childType)) {
-                    // WHEN condition THEN value
-                    sb.append("WHEN ");
-                    if (childNode.getChildCount() >= 2) {
-                        sb.append(getNodeText(childNode.getChild(0)));
-                        sb.append(" THEN ");
-                        sb.append(getNodeText(childNode.getChild(1)));
-                    }
-                } else if ("TOK_ELSE".equals(childType)) {
-                    // ELSE value
-                    sb.append(" ELSE ");
-                    if (childNode.getChildCount() > 0) {
-                        sb.append(getNodeText(childNode.getChild(0)));
-                    }
-                }
-            }
-        }
-
-        sb.append(" END");
-        return sb.toString();
-    }
-
-    /**
-     * 构建 CAST 表达式字符串
-     */
-    private static String buildCastExpressionString(ASTNode castNode) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("CAST(");
-
-        // CAST(expression AS type)
-        if (castNode.getChildCount() >= 2) {
-            sb.append(getNodeText(castNode.getChild(0)));
-            sb.append(" AS ");
-            sb.append(getNodeText(castNode.getChild(1)));
-        }
-
-        sb.append(")");
-        return sb.toString();
-    }
-
-    /**
-     * 构建 table.* 引用字符串
-     */
-    private static String buildAllColRefString(ASTNode allColNode) {
-        StringBuilder sb = new StringBuilder();
-        if (allColNode.getChildCount() > 0) {
-            sb.append(getNodeText(allColNode.getChild(0)));
-        }
-        sb.append(".*");
-        return sb.toString();
     }
 }
