@@ -32,6 +32,12 @@ public class HiveLineageParser {
     // CTE 字段血缘缓存
     private Map<String, Map<String, FieldLineage>> cteFieldCache = new HashMap<>();
 
+    // 子查询字段血缘缓存（用于追踪嵌套子查询的字段来源）
+    private Map<String, Map<String, FieldLineage>> subqueryFieldCache = new HashMap<>();
+
+    // 子查询别名到真实表的映射（用于 SELECT * 展开）
+    private Map<String, Set<String>> subqueryToRealTablesMap = new HashMap<>();
+
     /**
      * SQL 解析结果类
      */
@@ -196,8 +202,10 @@ public class HiveLineageParser {
             throw new IllegalStateException("必须先连接到 Hive Metastore 才能进行解析。请调用 connect() 方法。");
         }
 
-        // 清空 CTE 缓存
+        // 清空 CTE 和子查询缓存
         cteFieldCache.clear();
+        subqueryFieldCache.clear();
+        subqueryToRealTablesMap.clear();
 
         // 预处理SQL：处理反引号引用的标识符
         String processedSql = preprocessSql(sql);
@@ -207,6 +215,9 @@ public class HiveLineageParser {
 
         // 先解析 CTE 定义并缓存其字段血缘
         parseAndCacheCTEs(astTree);
+
+        // 解析子查询并缓存其字段血缘（支持嵌套子查询）
+        parseAndCacheSubqueries(astTree);
 
         // 获取 SQL 类型
         String sqlType = "UNKNOWN";
@@ -232,39 +243,27 @@ public class HiveLineageParser {
 
         // 根据 SQL 类型处理
         if (hasInsert) {
-            // INSERT 语句优先处理
+            // INSERT 语句（包括 WITH ... INSERT ...）
             targetTable = extractInsertTargetTable(astTree);
             sourceTables = extractSourceTables(astTree, cteTableNames);
             fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
-        } else {
-            switch (sqlType) {
-                case "TOK_CREATETABLE":
-                case "TOK_CREATE_TABLE":
-                    targetTable = extractTargetTable(astTree);
-                    sourceTables = extractSourceTables(astTree, cteTableNames);
-                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
-                    break;
-                case "TOK_QUERY":
-                    targetTable = "QUERY_RESULT";
-                    sourceTables = extractSourceTables(astTree, cteTableNames);
-                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
-                    break;
-                case "TOK_UNION":
-                    targetTable = "UNION_RESULT";
-                    sourceTables = extractSourceTables(astTree, cteTableNames);
-                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
-                    break;
-                case "TOK_WITH_CLAUSE":
-                case "TOK_CTE":
-                    targetTable = "CTE_RESULT";
-                    sourceTables = extractSourceTables(astTree, cteTableNames);
-                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
-                    break;
-                default:
-                    sourceTables = extractSourceTables(astTree, cteTableNames);
-                    fieldLineagesList = extractFieldLineages(astTree, targetTable != null ? targetTable : "UNKNOWN", cteTableNames);
-                    break;
+
+            // 修正 sqlType：确保 INSERT 语句有正确的类型标识
+            if ("TOK_QUERY".equals(sqlType)) {
+                sqlType = "TOK_QUERY_INSERT";
             }
+        } else if ("TOK_CREATETABLE".equals(sqlType) || "TOK_CREATE_TABLE".equals(sqlType)) {
+            // CREATE TABLE AS SELECT
+            targetTable = extractTargetTable(astTree);
+            sourceTables = extractSourceTables(astTree, cteTableNames);
+            fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+        } else {
+            // 普通查询（包括 WITH ... SELECT ...）
+            // 注意：TOK_WITH_CLAUSE、TOK_CTE、TOK_UNION 等不会作为顶层类型出现
+            // 它们都会被识别为 TOK_QUERY，CTE 的处理已在前面完成
+            targetTable = "QUERY_RESULT";
+            sourceTables = extractSourceTables(astTree, cteTableNames);
+            fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
         }
 
         extractJoinInformation(astTree, sourceTables);
@@ -285,38 +284,56 @@ public class HiveLineageParser {
 
         for (FieldLineage lineage : fieldLineagesList) {
             try {
-                // 展开 CTE 字段的血缘
+                // 展开 CTE 和子查询字段的血缘
                 expandCTEFieldLineage(lineage);
+                expandSubqueryFieldLineage(lineage);
 
-                // 过滤掉仍然指向 CTE 表的依赖（这些没有被正确展开的）
+                // 第一步：过滤掉指向 CTE 表和子查询别名的依赖
                 List<FieldLineage> filteredDependencies = new ArrayList<>();
                 for (FieldLineage dep : lineage.getDependencies()) {
-                    if (!cteFieldCache.containsKey(dep.getTableName())) {
+                    if (!cteFieldCache.containsKey(dep.getTableName()) &&
+                        !subqueryFieldCache.containsKey(dep.getTableName())) {
                         filteredDependencies.add(dep);
                     }
                 }
-                lineage.getDependencies().clear();
-                lineage.getDependencies().addAll(filteredDependencies);
 
-                // 验证依赖字段
-                for (FieldLineage dependency : lineage.getDependencies()) {
-                    FieldSchema sourceFieldSchema = validateField(
-                        dependency.getTableName(),
-                        dependency.getFieldName()
-                    );
-                    if (sourceFieldSchema == null) {
+                // 第二步：验证每个依赖字段是否在 Metastore 中存在
+                // 如果不存在，则从依赖列表中移除（不是抛出错误，而是静默移除）
+                List<FieldLineage> validatedDependencies = new ArrayList<>();
+                for (FieldLineage dependency : filteredDependencies) {
+                    try {
+                        FieldSchema sourceFieldSchema = validateField(
+                            dependency.getTableName(),
+                            dependency.getFieldName()
+                        );
+                        if (sourceFieldSchema != null) {
+                            // 字段存在，保留这个依赖
+                            validatedDependencies.add(dependency);
+                        } else {
+                            // 字段不存在，移除这个依赖（不保留不存在的字段引用）
+                            allValidated = false;
+                            System.out.println("Info: Source field not found in Metastore, removed from lineage: " +
+                                dependency.getTableName() + "." + dependency.getFieldName());
+                        }
+                    } catch (Exception e) {
+                        // 验证失败（如表不存在），移除这个依赖
                         allValidated = false;
-                        System.out.println("Warning: Source field not found in Metastore: " +
-                            dependency.getTableName() + "." + dependency.getFieldName());
+                        System.out.println("Info: Failed to validate field, removed from lineage: " +
+                            dependency.getTableName() + "." + dependency.getFieldName() + " - " + e.getMessage());
                     }
                 }
+
+                // 更新依赖列表为只包含已验证存在的字段
+                lineage.getDependencies().clear();
+                lineage.getDependencies().addAll(validatedDependencies);
+
                 // 只添加非 UNKNOWN 字段名的血缘
                 if (!"UNKNOWN".equals(lineage.getFieldName())) {
                     fieldLineages.put(lineage.getFieldName(), lineage);
                 }
             } catch (Exception e) {
                 allValidated = false;
-                System.err.println("Error validating field " + lineage.getTableName() + "." +
+                System.err.println("Error processing field " + lineage.getTableName() + "." +
                     lineage.getFieldName() + ": " + e.getMessage());
                 lineage.setFieldType(FieldLineage.FieldType.ERROR);
                 if (!"UNKNOWN".equals(lineage.getFieldName())) {
@@ -332,10 +349,14 @@ public class HiveLineageParser {
      * 获取所有源字段的集合
      *
      * @param fieldLineages 字段血缘映射
+     * @param sqlType SQL 类型（TOK_QUERY 或 TOK_INSERT）
      * @return 字段全名 -> 源字段集合
      */
-    public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> fieldLineages) {
+    public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> fieldLineages, String sqlType) {
         Map<String, Set<String>> result = new HashMap<>();
+        boolean isInsert = sqlType != null && sqlType.contains("INSERT");
+
+        System.out.println("DEBUG getAllSourceFields: sqlType=" + sqlType + ", isInsert=" + isInsert);
 
         for (Map.Entry<String, FieldLineage> entry : fieldLineages.entrySet()) {
             String fieldName = entry.getKey();
@@ -343,13 +364,29 @@ public class HiveLineageParser {
 
             Set<String> sourceFields = lineage.getAllSourceFields();
 
-            String fullName = lineage.getTableName() != null ?
-                lineage.getTableName() + "." + fieldName : fieldName;
+            // SELECT 语句：左边只显示字段名；INSERT 语句：左边显示 表名.字段名
+            String displayName;
+            if (isInsert) {
+                displayName = lineage.getTableName() != null ?
+                    lineage.getTableName() + "." + fieldName : fieldName;
+            } else {
+                displayName = fieldName;
+            }
 
-            result.put(fullName, sourceFields);
+            result.put(displayName, sourceFields);
         }
 
         return result;
+    }
+
+    /**
+     * 获取所有源字段的集合（保持向后兼容）
+     *
+     * @param fieldLineages 字段血缘映射
+     * @return 字段全名 -> 源字段集合
+     */
+    public static Map<String, Set<String>> getAllSourceFields(Map<String, FieldLineage> fieldLineages) {
+        return getAllSourceFields(fieldLineages, "TOK_QUERY");
     }
 
     // ==================== 私有辅助方法 ====================
@@ -445,6 +482,146 @@ public class HiveLineageParser {
             }
         });
         System.out.println("===== DEBUG: CTE Parsing Complete =====");
+    }
+
+    /**
+     * 解析并缓存子查询的字段血缘（用于嵌套子查询的字段追踪）
+     */
+    private void parseAndCacheSubqueries(ASTNode astTree) {
+        System.out.println("===== DEBUG: Parsing Subqueries =====");
+        Set<String> processedSubqueries = new HashSet<>();
+        parseAndCacheSubqueriesRecursive(astTree, processedSubqueries);
+        System.out.println("===== DEBUG: Subquery Parsing Complete, cached " +
+            subqueryFieldCache.size() + " subqueries =====");
+    }
+
+    /**
+     * 递归解析并缓存子查询（从内到外）
+     */
+    private void parseAndCacheSubqueriesRecursive(ASTNode astTree, Set<String> processedSubqueries) {
+        if (astTree == null) {
+            return;
+        }
+
+        // 查找所有 TOK_SUBQUERY 节点
+        List<ASTNode> subqueryNodes = findAllNodes(astTree, "TOK_SUBQUERY");
+
+        for (ASTNode subqueryNode : subqueryNodes) {
+            String subqueryAlias = null;
+            ASTNode queryNode = null;
+
+            // 遍历 TOK_SUBQUERY 的子节点
+            for (int i = 0; i < subqueryNode.getChildCount(); i++) {
+                Object child = subqueryNode.getChild(i);
+                if (!(child instanceof ASTNode)) continue;
+
+                ASTNode childNode = (ASTNode) child;
+                String tokenText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+
+                // TOK_QUERY 是查询内容
+                if ("TOK_QUERY".equals(tokenText)) {
+                    queryNode = childNode;
+                }
+                // 表名/别名（不是 TOK_ 开头）
+                else if (!tokenText.startsWith("TOK_") && subqueryAlias == null) {
+                    subqueryAlias = childNode.getText();
+                }
+            }
+
+            // 如果找到了查询节点，先递归解析其内部的子查询（从内到外）
+            if (queryNode != null) {
+                parseAndCacheSubqueriesRecursive(queryNode, processedSubqueries);
+            }
+
+            // 然后再处理当前子查询
+            if (subqueryAlias != null && !subqueryAlias.isEmpty() &&
+                queryNode != null && !"UNKNOWN".equals(subqueryAlias)) {
+
+                // 使用节点对象作为唯一标识，避免重复处理
+                String cacheKey = subqueryAlias + "@" + System.identityHashCode(subqueryNode);
+                if (!processedSubqueries.contains(cacheKey)) {
+                    processedSubqueries.add(cacheKey);
+
+                    System.out.println("  Caching subquery: " + subqueryAlias + " (id=" +
+                        Integer.toHexString(System.identityHashCode(subqueryNode)) + ")");
+
+                    // 解析子查询的字段血缘（只使用子查询内部的表别名）
+                    Set<String> emptyCteSet = new HashSet<>();
+                    List<FieldLineage> fieldLineagesList = extractFieldLineages(
+                        queryNode, subqueryAlias, emptyCteSet);
+
+                    Map<String, FieldLineage> subqueryFields = new HashMap<>();
+                    for (FieldLineage lineage : fieldLineagesList) {
+                        // 展开子查询字段的血缘（包括 CTE 和其他子查询）
+                        expandCTEFieldLineage(lineage);
+                        expandSubqueryFieldLineage(lineage);
+                        subqueryFields.put(lineage.getFieldName(), lineage);
+                    }
+
+                    // 使用别名作为 key，允许同名子查询覆盖（外层覆盖内层）
+                    subqueryFieldCache.put(subqueryAlias, subqueryFields);
+                    System.out.println("  Cached " + subqueryFields.size() +
+                        " fields for subquery: " + subqueryAlias);
+                }
+            }
+        }
+    }
+
+    /**
+     * 展开字段的子查询血缘
+     * 如果字段的依赖指向子查询别名，则用子查询的字段血缘替换
+     */
+    private void expandSubqueryFieldLineage(FieldLineage lineage) {
+        expandSubqueryFieldLineage(lineage, new HashSet<>());
+    }
+
+    /**
+     * 展开字段的子查询血缘（带循环检测）
+     */
+    private void expandSubqueryFieldLineage(FieldLineage lineage, Set<String> expanding) {
+        if (lineage == null || lineage.getDependencies() == null) {
+            return;
+        }
+
+        // 循环检测
+        String fieldKey = lineage.getTableName() + "." + lineage.getFieldName();
+        if (expanding.contains(fieldKey)) {
+            System.err.println("Warning: Circular reference detected in subquery: " + fieldKey);
+            return;
+        }
+
+        List<FieldLineage> originalDependencies = new ArrayList<>(lineage.getDependencies());
+        lineage.getDependencies().clear();
+
+        for (FieldLineage dependency : originalDependencies) {
+            String depTableName = dependency.getTableName();
+
+            // 检查是否是子查询别名
+            if (subqueryFieldCache.containsKey(depTableName)) {
+                // 这个依赖指向子查询，需要展开
+                Map<String, FieldLineage> subqueryFields = subqueryFieldCache.get(depTableName);
+                FieldLineage subqueryField = subqueryFields.get(dependency.getFieldName());
+
+                if (subqueryField != null) {
+                    // 递归展开（子查询可能依赖其他子查询或 CTE）
+                    expanding.add(fieldKey);
+                    expandSubqueryFieldLineage(subqueryField, expanding);
+                    expandCTEFieldLineage(subqueryField, expanding);
+                    expanding.remove(fieldKey);
+
+                    // 合并子查询字段的依赖到当前字段
+                    for (FieldLineage subqueryDependency : subqueryField.getDependencies()) {
+                        lineage.addDependency(cloneFieldLineage(subqueryDependency));
+                    }
+                } else {
+                    // 子查询中找不到该字段，保留原依赖
+                    lineage.addDependency(dependency);
+                }
+            } else {
+                // 不是子查询，保留原依赖
+                lineage.addDependency(dependency);
+            }
+        }
     }
 
     /**
@@ -727,7 +904,7 @@ public class HiveLineageParser {
         return tables;
     }
 
-    private static List<FieldLineage> extractFieldLineages(ASTNode astTree, String targetTable, Set<String> cteTableNames) {
+    private List<FieldLineage> extractFieldLineages(ASTNode astTree, String targetTable, Set<String> cteTableNames) {
         List<FieldLineage> lineages = new ArrayList<>();
 
         // 检查目标表是否是 CTE 表，如果是，则不排除任何表（因为 CTE 查询需要引用其源表）
@@ -749,13 +926,25 @@ public class HiveLineageParser {
                     ASTNode selExprNode = (ASTNode) child;
                     String nodeType = selExprNode.getToken() != null ? selExprNode.getToken().getText() : "";
                     if ("TOK_SELEXPR".equals(nodeType)) {
-                        // 提取字段名用于去重
-                        String fieldName = extractFieldName(selExprNode);
-                        String key = targetTable + "." + fieldName;
+                        // 检查是否是 *，如果是则展开
+                        if (isSelectStar(selExprNode)) {
+                            // 展开 * 为所有字段
+                            List<FieldLineage> expandedFields = expandSelectStar(selExprNode, targetTable, tableAliasMap);
+                            for (FieldLineage field : expandedFields) {
+                                String key = targetTable + "." + field.getFieldName();
+                                if (processedFields.add(key)) {
+                                    lineages.add(field);
+                                }
+                            }
+                        } else {
+                            // 提取字段名用于去重
+                            String fieldName = extractFieldName(selExprNode);
+                            String key = targetTable + "." + fieldName;
 
-                        // 只处理未重复的字段
-                        if (processedFields.add(key)) {
-                            processSelectExpr(selExprNode, targetTable, tableAliasMap, lineages);
+                            // 只处理未重复的字段
+                            if (processedFields.add(key)) {
+                                processSelectExpr(selExprNode, targetTable, tableAliasMap, lineages);
+                            }
                         }
                     }
                 }
@@ -763,6 +952,217 @@ public class HiveLineageParser {
         }
 
         return lineages;
+    }
+
+    /**
+     * 检查 TOK_SELEXPR 是否是 SELECT *
+     */
+    private boolean isSelectStar(ASTNode selExprNode) {
+        if (selExprNode.getChildCount() == 0) {
+            return false;
+        }
+
+        // 调试：打印子节点信息
+        System.out.println("DEBUG isSelectStar: node has " + selExprNode.getChildCount() + " children");
+        for (int i = 0; i < selExprNode.getChildCount(); i++) {
+            Object child = selExprNode.getChild(i);
+            if (child instanceof ASTNode) {
+                ASTNode childNode = (ASTNode) child;
+                String tokenText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+                System.out.println("  Child " + i + ": type=" + tokenText + ", text=" + childNode.getText());
+            }
+        }
+
+        Object firstChild = selExprNode.getChild(0);
+        if (firstChild instanceof ASTNode) {
+            ASTNode firstChildNode = (ASTNode) firstChild;
+            String tokenText = firstChildNode.getToken() != null ? firstChildNode.getToken().getText() : "";
+            // 可能是直接是 "*"
+            if ("*".equals(tokenText)) {
+                System.out.println("  -> Detected SELECT * (direct)");
+                return true;
+            }
+            // 或者是 TOK_ALLCOLREF
+            if ("TOK_ALLCOLREF".equals(tokenText)) {
+                System.out.println("  -> Detected SELECT * (TOK_ALLCOLREF)");
+                return true;
+            }
+        }
+        System.out.println("  -> Not SELECT *");
+        return false;
+    }
+
+    /**
+     * 展开 SELECT * 为所有字段
+     */
+    private List<FieldLineage> expandSelectStar(ASTNode selExprNode, String targetTable,
+                                                Map<String, String> tableAliasMap) {
+        List<FieldLineage> expandedFields = new ArrayList<>();
+
+        // 尝试从第一个子节点获取表限定符
+        String qualifier = null;
+        if (selExprNode.getChildCount() > 0) {
+            Object firstChild = selExprNode.getChild(0);
+            if (firstChild instanceof ASTNode) {
+                ASTNode firstChildNode = (ASTNode) firstChild;
+                String tokenText = firstChildNode.getToken() != null ? firstChildNode.getToken().getText() : "";
+
+                // 如果是 TOK_ALLCOLREF，检查是否有表限定符
+                if ("TOK_ALLCOLREF".equals(tokenText)) {
+                    if (firstChildNode.getChildCount() > 0) {
+                        Object qualifierChild = firstChildNode.getChild(0);
+                        if (qualifierChild instanceof ASTNode) {
+                            ASTNode qualifierNode = (ASTNode) qualifierChild;
+                            String qualifierToken = qualifierNode.getToken() != null ?
+                                qualifierNode.getToken().getText() : "";
+                            // 如果是 TOK_TABNAME，需要提取子节点的文本
+                            if ("TOK_TABNAME".equals(qualifierToken)) {
+                                qualifier = extractTableNameFromNode(qualifierNode);
+                            } else {
+                                qualifier = qualifierNode.getText();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 如果没有限定符，且有多个源表，展开所有表的字段
+        String tableName = null;
+        if (qualifier != null) {
+            tableName = tableAliasMap.getOrDefault(qualifier, null);
+        }
+
+        // 检查是否是子查询别名
+        if (qualifier != null && subqueryFieldCache.containsKey(qualifier)) {
+            // 从子查询缓存中获取字段列表
+            Map<String, FieldLineage> subqueryFields = subqueryFieldCache.get(qualifier);
+            for (Map.Entry<String, FieldLineage> entry : subqueryFields.entrySet()) {
+                String fieldName = entry.getKey();
+                FieldLineage subqueryField = entry.getValue();
+
+                FieldLineage fieldLineage = new FieldLineage();
+                fieldLineage.setFieldName(fieldName);
+                fieldLineage.setTableName(targetTable);
+                fieldLineage.setExpression(qualifier + ".*");
+                fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+                // 复制子查询字段的依赖
+                for (FieldLineage dep : subqueryField.getDependencies()) {
+                    fieldLineage.addDependency(cloneFieldLineage(dep));
+                }
+
+                expandedFields.add(fieldLineage);
+            }
+            System.out.println("Expanded SELECT * from subquery " + qualifier + " to " +
+                expandedFields.size() + " fields");
+            return expandedFields;
+        }
+
+        // 如果没有限定符，但有表别名映射
+        if (qualifier == null && !tableAliasMap.isEmpty()) {
+            if (tableAliasMap.size() == 1) {
+                // 只有一个表，使用它
+                tableName = tableAliasMap.values().iterator().next();
+            } else {
+                // 有多个表但没有限定符，展开所有表的字段
+                System.out.println("  Expanding SELECT * from all " + tableAliasMap.size() + " tables");
+                for (Map.Entry<String, String> entry : tableAliasMap.entrySet()) {
+                    String alias = entry.getKey();
+                    String realTable = entry.getValue();
+
+                    // 检查是否是子查询别名
+                    if (subqueryFieldCache.containsKey(alias)) {
+                        Map<String, FieldLineage> subqueryFields = subqueryFieldCache.get(alias);
+                        for (Map.Entry<String, FieldLineage> subEntry : subqueryFields.entrySet()) {
+                            String fieldName = subEntry.getKey();
+                            FieldLineage subqueryField = subEntry.getValue();
+
+                            FieldLineage fieldLineage = new FieldLineage();
+                            fieldLineage.setFieldName(fieldName);
+                            fieldLineage.setTableName(targetTable);
+                            fieldLineage.setExpression(alias + ".*");
+                            fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+                            for (FieldLineage dep : subqueryField.getDependencies()) {
+                                fieldLineage.addDependency(cloneFieldLineage(dep));
+                            }
+
+                            expandedFields.add(fieldLineage);
+                        }
+                    } else if (isConnected()) {
+                        // 从 Metastore 获取真实表的字段
+                        try {
+                            Map<String, FieldSchema> tableFields = getTableFields(realTable);
+                            for (Map.Entry<String, FieldSchema> fieldEntry : tableFields.entrySet()) {
+                                String fieldName = fieldEntry.getKey();
+
+                                FieldLineage fieldLineage = new FieldLineage();
+                                fieldLineage.setFieldName(fieldName);
+                                fieldLineage.setTableName(targetTable);
+                                fieldLineage.setExpression(realTable + ".*");
+                                fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+                                FieldLineage dependency = new FieldLineage();
+                                dependency.setFieldName(fieldName);
+                                dependency.setTableName(realTable);
+                                dependency.setSourceTableName(realTable);
+                                dependency.setFieldType(FieldLineage.FieldType.COLUMN);
+                                fieldLineage.addDependency(dependency);
+
+                                expandedFields.add(fieldLineage);
+                            }
+                        } catch (Exception e) {
+                            System.err.println("Failed to expand SELECT * for table " + realTable + ": " + e.getMessage());
+                        }
+                    }
+                }
+                System.out.println("Expanded SELECT * to " + expandedFields.size() + " fields from " +
+                    tableAliasMap.size() + " tables");
+                return expandedFields;
+            }
+        }
+
+        // 如果找到了真实表名，从 Metastore 获取所有字段
+        if (tableName != null && isConnected()) {
+            try {
+                Map<String, FieldSchema> tableFields = getTableFields(tableName);
+                for (Map.Entry<String, FieldSchema> entry : tableFields.entrySet()) {
+                    String fieldName = entry.getKey();
+
+                    FieldLineage fieldLineage = new FieldLineage();
+                    fieldLineage.setFieldName(fieldName);
+                    fieldLineage.setTableName(targetTable);
+                    fieldLineage.setExpression(tableName + ".*");
+                    fieldLineage.setFieldType(FieldLineage.FieldType.COLUMN);
+
+                    // 添加依赖：targetTable.field -> sourceTable.field
+                    FieldLineage dependency = new FieldLineage();
+                    dependency.setFieldName(fieldName);
+                    dependency.setTableName(tableName);
+                    dependency.setSourceTableName(tableName);  // 重要：设置 sourceTableName
+                    dependency.setFieldType(FieldLineage.FieldType.COLUMN);
+                    fieldLineage.addDependency(dependency);
+
+                    expandedFields.add(fieldLineage);
+                }
+                System.out.println("Expanded SELECT * to " + expandedFields.size() + " fields from table: " + tableName);
+                return expandedFields;
+            } catch (Exception e) {
+                System.err.println("Failed to expand SELECT * for table " + tableName + ": " + e.getMessage());
+            }
+        }
+
+        // 如果无法展开，返回一个特殊的字段表示无法解析
+        System.err.println("Could not expand SELECT * - qualifier=" + qualifier +
+            ", tableName=" + tableName + ", tableAliasMap=" + tableAliasMap);
+        FieldLineage fallbackField = new FieldLineage();
+        fallbackField.setFieldName("*");
+        fallbackField.setTableName(targetTable);
+        fallbackField.setExpression("*");
+        fallbackField.setFieldType(FieldLineage.FieldType.ERROR);
+        expandedFields.add(fallbackField);
+        return expandedFields;
     }
 
     /**
@@ -1378,6 +1778,7 @@ public class HiveLineageParser {
         HiveLineageParser parser = new HiveLineageParser();
 
         String[] testSqls = {
+                "select appid,msg_source,split,business,new_session,session_id,info_id,rootcateid,cateid,city,post_user_id,msg_category,ack_time,show_time,original_table,msg_id,time,nvl(t2.merchant_user_id,t1.sender_id) as sender_id,sender_source,sender_info,nvl(t3.merchant_user_id,t1.to_id) as to_id,to_source,to_info,msg_type,show_type,msg_content,options,refer,result,client_version,client_type,sdk_version,os_type,os_version,ip,role,scene,device_info,xxzl_smartid,crypt_to_id,sender_device_id,to_device_id,applet,bg,business_type,cateid_info,sender_id_f,sender_source_f,to_id_f,to_source_f,ack_appid,show_appid,dt from (select t1.* from (select * from hdp_teu_spat_im_defaultdb.im_original_stat_msg where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' and result = '1' and business_type='二手车' and msg_category = 4 and rootcateid = 4) t1 left join (select a.dt,a.msg_id from (select dt,msg_id from hdp_teu_spat_im_defaultdb.im_original_stat_msg where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' and business_type='二手车' and (sender_source = '9999' or to_source = '9999') group by dt,msg_id) a left join (select dt,msg_id from hdp_teu_dpd_viewdb.vw_hdp_teu_spat_wis_msg_a234457 where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' group by dt,msg_id) b on a.dt=b.dt and a.msg_id = b.msg_id where b.msg_id is null) t2 on t1.dt =t2.dt and t1.msg_id=t2.msg_id where t2.msg_id is null) t1 left join (select user_id,merchant_user_id,source from hdp_ershouche_defaultdb.ods_usedcar_db58_cheapi_im_third_user_info_all_d where dt=regexp_replace(date_sub(current_date(),2),'-','') group by user_id,merchant_user_id,source) t2 on t1.sender_id=t2.user_id and t1.sender_source=t2.source left join (select user_id,merchant_user_id,source from hdp_ershouche_defaultdb.ods_usedcar_db58_cheapi_im_third_user_info_all_d where dt=regexp_replace(date_sub(current_date(),2),'-','') group by user_id,merchant_user_id,source) t3 on t1.to_id=t3.user_id and t1.to_source=t3.source",
             "insert overwrite table hdp_teu_dpd_feature_db.hbg_user_action_log partition(dt = '${dateSuffix}') select imei, userid, pagetype, actiontype, wuxian_data from hdp_teu_dpd_wx_flow.dwd_wx_flow_58app_hbg_and_58local_action_view where dt = '${#date(0,0,-1):yyyyMMdd#}' and cate1 = '1' and actiontype in ('200000006713008400000100','200000006941031200000001','200000005529000100000100','200000005781000100000100')",
             "with entry_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1002' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1002' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'F5143' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'F5143' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1001' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1001' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmshow' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w')),module_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] != '0' and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') union all select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] in ('00','01','02','03','04','05','06','07','08') and datapool['sectionId'] not in ('2027090','1963438','1966403','1966370','2008566')) insert OVERWRITE table hdp_ubu_zhuanzhuan_ads_lux.ads_lux_zz_seckill_detail_inc_1d PARTITION(dt='20260313') select dt stat_date,'入口' type,entry,0 module,token from entry_data union all select dt stat_date,'入口模块' type,entry,module,token from module_data",
             "INSERT INTO target_table SELECT col1, col2 * 2 as double_col2 FROM source_table"
@@ -1397,7 +1798,7 @@ public class HiveLineageParser {
                     System.out.println(result);
 
                     System.out.println("Source Fields Mapping:");
-                    Map<String, Set<String>> sourceFieldsMap = getAllSourceFields(result.getFieldLineagesMap());
+                    Map<String, Set<String>> sourceFieldsMap = getAllSourceFields(result.getFieldLineagesMap(), result.getSqlType());
                     for (Map.Entry<String, Set<String>> entry : sourceFieldsMap.entrySet()) {
                         System.out.println("  " + entry.getKey() + " → " + entry.getValue());
                     }
