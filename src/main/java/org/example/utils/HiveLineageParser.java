@@ -29,6 +29,9 @@ public class HiveLineageParser {
     private HiveMetaStoreClient metaStoreClient;
     private boolean connected = false;
 
+    // CTE 字段血缘缓存
+    private Map<String, Map<String, FieldLineage>> cteFieldCache = new HashMap<>();
+
     /**
      * SQL 解析结果类
      */
@@ -193,11 +196,17 @@ public class HiveLineageParser {
             throw new IllegalStateException("必须先连接到 Hive Metastore 才能进行解析。请调用 connect() 方法。");
         }
 
+        // 清空 CTE 缓存
+        cteFieldCache.clear();
+
         // 预处理SQL：处理反引号引用的标识符
         String processedSql = preprocessSql(sql);
 
         ParseDriver parseDriver = new ParseDriver();
         ASTNode astTree = parseDriver.parse(processedSql);
+
+        // 先解析 CTE 定义并缓存其字段血缘
+        parseAndCacheCTEs(astTree);
 
         // 获取 SQL 类型
         String sqlType = "UNKNOWN";
@@ -214,47 +223,61 @@ public class HiveLineageParser {
         List<FieldLineage> fieldLineagesList = new ArrayList<>();
         Set<String> sourceTables = new HashSet<>();
 
+        // 提取 CTE 表名（需要排除，因为它们不是真实表）
+        Set<String> cteTableNames = extractCTETableNames(astTree);
+
+        // 检查是否有 INSERT 操作（优先级最高，因为 WITH + INSERT 会先识别为 WITH）
+        boolean hasInsert = findNode(astTree, "TOK_INSERT_INTO") != null ||
+                          findNode(astTree, "TOK_INSERT") != null;
+
         // 根据 SQL 类型处理
-        switch (sqlType) {
-            case "TOK_CREATETABLE":
-            case "TOK_CREATE_TABLE":
-                targetTable = extractTargetTable(astTree);
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable);
-                break;
-            case "TOK_QUERY":
-                ASTNode insertIntoNode = findNode(astTree, "TOK_INSERT_INTO");
-                if (insertIntoNode != null) {
-                    targetTable = extractInsertTargetTable(astTree);
-                } else {
+        if (hasInsert) {
+            // INSERT 语句优先处理
+            targetTable = extractInsertTargetTable(astTree);
+            sourceTables = extractSourceTables(astTree, cteTableNames);
+            fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+        } else {
+            switch (sqlType) {
+                case "TOK_CREATETABLE":
+                case "TOK_CREATE_TABLE":
+                    targetTable = extractTargetTable(astTree);
+                    sourceTables = extractSourceTables(astTree, cteTableNames);
+                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+                    break;
+                case "TOK_QUERY":
                     targetTable = "QUERY_RESULT";
-                }
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable);
-                break;
-            case "TOK_INSERT":
-                targetTable = extractInsertTargetTable(astTree);
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable);
-                break;
-            case "TOK_UNION":
-                targetTable = "UNION_RESULT";
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable);
-                break;
-            case "TOK_WITH_CLAUSE":
-            case "TOK_CTE":
-                targetTable = "CTE_RESULT";
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable);
-                break;
-            default:
-                sourceTables = extractSourceTables(astTree);
-                fieldLineagesList = extractFieldLineages(astTree, targetTable != null ? targetTable : "UNKNOWN");
-                break;
+                    sourceTables = extractSourceTables(astTree, cteTableNames);
+                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+                    break;
+                case "TOK_UNION":
+                    targetTable = "UNION_RESULT";
+                    sourceTables = extractSourceTables(astTree, cteTableNames);
+                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+                    break;
+                case "TOK_WITH_CLAUSE":
+                case "TOK_CTE":
+                    targetTable = "CTE_RESULT";
+                    sourceTables = extractSourceTables(astTree, cteTableNames);
+                    fieldLineagesList = extractFieldLineages(astTree, targetTable, cteTableNames);
+                    break;
+                default:
+                    sourceTables = extractSourceTables(astTree, cteTableNames);
+                    fieldLineagesList = extractFieldLineages(astTree, targetTable != null ? targetTable : "UNKNOWN", cteTableNames);
+                    break;
+            }
         }
 
         extractJoinInformation(astTree, sourceTables);
+
+        // 从 sourceTables 中移除 CTE 表名（CTE 不是真实表）
+        System.out.println("DEBUG: Original source tables: " + sourceTables);
+        System.out.println("DEBUG: Extracted CTE table names: " + cteTableNames);
+        System.out.println("DEBUG: Cached CTEs: " + cteFieldCache.keySet());
+        Set<String> realSourceTables = new HashSet<>(sourceTables);
+        realSourceTables.removeAll(cteTableNames);
+        // 更新 sourceTables 为不包含 CTE 的版本
+        sourceTables = realSourceTables;
+        System.out.println("DEBUG: Final source tables (excluding CTEs): " + sourceTables);
 
         // 转换为 Map 格式并验证元数据
         Map<String, FieldLineage> fieldLineages = new HashMap<>();
@@ -262,6 +285,19 @@ public class HiveLineageParser {
 
         for (FieldLineage lineage : fieldLineagesList) {
             try {
+                // 展开 CTE 字段的血缘
+                expandCTEFieldLineage(lineage);
+
+                // 过滤掉仍然指向 CTE 表的依赖（这些没有被正确展开的）
+                List<FieldLineage> filteredDependencies = new ArrayList<>();
+                for (FieldLineage dep : lineage.getDependencies()) {
+                    if (!cteFieldCache.containsKey(dep.getTableName())) {
+                        filteredDependencies.add(dep);
+                    }
+                }
+                lineage.getDependencies().clear();
+                lineage.getDependencies().addAll(filteredDependencies);
+
                 // 验证依赖字段
                 for (FieldLineage dependency : lineage.getDependencies()) {
                     FieldSchema sourceFieldSchema = validateField(
@@ -274,13 +310,18 @@ public class HiveLineageParser {
                             dependency.getTableName() + "." + dependency.getFieldName());
                     }
                 }
-                fieldLineages.put(lineage.getFieldName(), lineage);
+                // 只添加非 UNKNOWN 字段名的血缘
+                if (!"UNKNOWN".equals(lineage.getFieldName())) {
+                    fieldLineages.put(lineage.getFieldName(), lineage);
+                }
             } catch (Exception e) {
                 allValidated = false;
                 System.err.println("Error validating field " + lineage.getTableName() + "." +
                     lineage.getFieldName() + ": " + e.getMessage());
                 lineage.setFieldType(FieldLineage.FieldType.ERROR);
-                fieldLineages.put(lineage.getFieldName(), lineage);
+                if (!"UNKNOWN".equals(lineage.getFieldName())) {
+                    fieldLineages.put(lineage.getFieldName(), lineage);
+                }
             }
         }
 
@@ -313,6 +354,221 @@ public class HiveLineageParser {
 
     // ==================== 私有辅助方法 ====================
 
+    /**
+     * 解析并缓存 CTE 的字段血缘
+     */
+    private void parseAndCacheCTEs(ASTNode astTree) {
+        System.out.println("===== DEBUG: Parsing CTEs =====");
+        findNode(astTree, "TOK_CTE", node -> {
+            ASTNode cteNode = (ASTNode) node;
+            System.out.println("TOK_CTE has " + cteNode.getChildCount() + " children");
+
+            // 一个 TOK_CTE 可能包含多个子节点，每个子节点可能是一个独立的 CTE 定义
+            // 遍历所有子节点，查找 CTE 定义（每个 TOK_SUBQUERY 可能是一个 CTE）
+            for (int i = 0; i < cteNode.getChildCount(); i++) {
+                Object child = cteNode.getChild(i);
+                if (!(child instanceof ASTNode)) continue;
+
+                ASTNode childNode = (ASTNode) child;
+                String tokenText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+
+                System.out.println("Child " + i + ": type=" + tokenText + ", text=" + childNode.getText() +
+                    ", children=" + childNode.getChildCount());
+
+                // 如果是 TOK_SUBQUERY，可能是一个完整的 CTE 定义
+                if ("TOK_SUBQUERY".equals(tokenText)) {
+                    String cteTableName = null;
+                    ASTNode queryNode = null;
+
+                    System.out.println("  Processing as potential CTE definition");
+
+                    // 遍历 TOK_SUBQUERY 的子节点
+                    for (int j = 0; j < childNode.getChildCount(); j++) {
+                        Object subChild = childNode.getChild(j);
+                        if (!(subChild instanceof ASTNode)) continue;
+
+                        ASTNode subChildNode = (ASTNode) subChild;
+                        String subToken = subChildNode.getToken() != null ? subChildNode.getToken().getText() : "";
+
+                        System.out.println("    SubChild " + j + ": type=" + subToken + ", text=" + subChildNode.getText());
+
+                        // TOK_QUERY 是查询内容
+                        if ("TOK_QUERY".equals(subToken)) {
+                            queryNode = subChildNode;
+                        }
+                        // 表名/别名（不是 TOK_ 开头）
+                        else if (!subToken.startsWith("TOK_") && cteTableName == null) {
+                            cteTableName = subChildNode.getText();
+                            System.out.println("      -> Found CTE table name: " + cteTableName);
+                        }
+                        // 也可能是 TOK_TABNAME
+                        else if ("TOK_TABNAME".equals(subToken) && cteTableName == null) {
+                            cteTableName = extractTableNameFromNode(subChildNode);
+                            System.out.println("      -> Found CTE table name (TOK_TABNAME): " + cteTableName);
+                        }
+                    }
+
+                    // 如果找到了表名和查询，缓存这个 CTE
+                    if (cteTableName != null && !cteTableName.isEmpty() && queryNode != null) {
+                        if ("UNKNOWN".equals(cteTableName)) {
+                            System.err.println("    Warning: CTE table name is UNKNOWN, skipping");
+                            continue;
+                        }
+
+                        System.out.println("  Caching CTE: " + cteTableName);
+
+                        // 递归解析 CTE 查询（支持嵌套 CTE）
+                        Map<String, FieldLineage> cteFields = new HashMap<>();
+                        Set<String> nestedCteTables = extractCTETableNames(queryNode);
+
+                        List<FieldLineage> fieldLineagesList = extractFieldLineages(queryNode, cteTableName, nestedCteTables);
+                        System.out.println("  CTE " + cteTableName + " has " + fieldLineagesList.size() + " fields:");
+
+                        for (FieldLineage lineage : fieldLineagesList) {
+                            System.out.println("    - " + lineage.getFieldName() + " with " + lineage.getDependencies().size() + " deps");
+                            // 展开 CTE 字段的血缘（处理嵌套 CTE）
+                            expandCTEFieldLineage(lineage);
+                            cteFields.put(lineage.getFieldName(), lineage);
+                        }
+
+                        cteFieldCache.put(cteTableName, cteFields);
+                        System.out.println("  Cached " + cteFields.size() + " fields for CTE: " + cteTableName);
+                    } else {
+                        if (cteTableName == null) {
+                            System.err.println("    Warning: Could not extract table name from TOK_SUBQUERY");
+                        }
+                        if (queryNode == null) {
+                            System.err.println("    Warning: Could not find TOK_QUERY in TOK_SUBQUERY");
+                        }
+                    }
+                }
+            }
+        });
+        System.out.println("===== DEBUG: CTE Parsing Complete =====");
+    }
+
+    /**
+     * 展开字段的 CTE 血缘
+     * 如果字段的依赖指向 CTE 表，则用 CTE 的字段血缘替换
+     */
+    private void expandCTEFieldLineage(FieldLineage lineage) {
+        expandCTEFieldLineage(lineage, new HashSet<>());
+    }
+
+    /**
+     * 展开字段的 CTE 血缘（带循环检测）
+     * @param lineage 要展开的字段血缘
+     * @param expanding 正在展开的字段集合（用于循环检测）
+     */
+    private void expandCTEFieldLineage(FieldLineage lineage, Set<String> expanding) {
+        if (lineage == null || lineage.getDependencies() == null) {
+            return;
+        }
+
+        // 循环检测：如果这个字段正在被展开，说明存在循环引用
+        String fieldKey = lineage.getTableName() + "." + lineage.getFieldName();
+        if (expanding.contains(fieldKey)) {
+            System.err.println("Warning: Circular reference detected in CTE: " + fieldKey);
+            return;
+        }
+
+        List<FieldLineage> originalDependencies = new ArrayList<>(lineage.getDependencies());
+        lineage.getDependencies().clear();
+
+        for (FieldLineage dependency : originalDependencies) {
+            String depTableName = dependency.getTableName();
+            if (cteFieldCache.containsKey(depTableName)) {
+                // 这个依赖指向 CTE 表，需要展开
+                Map<String, FieldLineage> cteFields = cteFieldCache.get(depTableName);
+                FieldLineage cteField = cteFields.get(dependency.getFieldName());
+
+                if (cteField != null) {
+                    // 递归展开（CTE 可能依赖其他 CTE）
+                    expanding.add(fieldKey);
+                    expandCTEFieldLineage(cteField, expanding);
+                    expanding.remove(fieldKey);
+
+                    // 合并 CTE 字段的依赖到当前字段
+                    for (FieldLineage cteDependency : cteField.getDependencies()) {
+                        lineage.addDependency(cloneFieldLineage(cteDependency));
+                    }
+                } else {
+                    // CTE 中找不到该字段，保留原依赖
+                    lineage.addDependency(dependency);
+                }
+            } else {
+                // 不是 CTE 表，保留原依赖
+                lineage.addDependency(dependency);
+            }
+        }
+    }
+
+    /**
+     * 克隆字段血缘对象
+     */
+    private FieldLineage cloneFieldLineage(FieldLineage original) {
+        FieldLineage cloned = new FieldLineage();
+        cloned.setFieldName(original.getFieldName());
+        cloned.setTableName(original.getTableName());
+        cloned.setSourceTableName(original.getSourceTableName());
+        cloned.setFieldType(original.getFieldType());
+        cloned.setExpression(original.getExpression());
+
+        for (FieldLineage dep : original.getDependencies()) {
+            cloned.addDependency(cloneFieldLineage(dep));
+        }
+
+        return cloned;
+    }
+
+    /**
+     * 提取 CTE 表名（WITH 子句中定义的临时表）
+     */
+    private static Set<String> extractCTETableNames(ASTNode astTree) {
+        Set<String> cteTables = new HashSet<>();
+        findNode(astTree, "TOK_CTE", node -> {
+            ASTNode cteNode = (ASTNode) node;
+
+            // 一个 TOK_CTE 可能包含多个子节点，每个子节点可能是一个独立的 CTE 定义
+            // 遍历所有子节点，查找 CTE 定义（每个 TOK_SUBQUERY 可能是一个 CTE）
+            for (int i = 0; i < cteNode.getChildCount(); i++) {
+                Object child = cteNode.getChild(i);
+                if (!(child instanceof ASTNode)) continue;
+
+                ASTNode childNode = (ASTNode) child;
+                String tokenText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+
+                // 如果是 TOK_SUBQUERY，可能是一个完整的 CTE 定义
+                if ("TOK_SUBQUERY".equals(tokenText)) {
+                    String cteTableName = null;
+
+                    // 遍历 TOK_SUBQUERY 的子节点
+                    for (int j = 0; j < childNode.getChildCount(); j++) {
+                        Object subChild = childNode.getChild(j);
+                        if (!(subChild instanceof ASTNode)) continue;
+
+                        ASTNode subChildNode = (ASTNode) subChild;
+                        String subToken = subChildNode.getToken() != null ? subChildNode.getToken().getText() : "";
+
+                        // 表名/别名（不是 TOK_ 开头）
+                        if (!subToken.startsWith("TOK_") && cteTableName == null) {
+                            cteTableName = subChildNode.getText();
+                        }
+                        // 也可能是 TOK_TABNAME
+                        else if ("TOK_TABNAME".equals(subToken) && cteTableName == null) {
+                            cteTableName = extractTableNameFromNode(subChildNode);
+                        }
+                    }
+
+                    if (cteTableName != null && !cteTableName.isEmpty() && !"UNKNOWN".equals(cteTableName)) {
+                        cteTables.add(cteTableName);
+                    }
+                }
+            }
+        });
+        return cteTables;
+    }
+
     private static String extractTargetTable(ASTNode astTree) {
         List<String> tableNameList = new ArrayList<>();
         findNode(astTree, "TOK_TABNAME", node -> {
@@ -332,29 +588,122 @@ public class HiveLineageParser {
     }
 
     private static String extractInsertTargetTable(ASTNode astTree) {
-        String tableName = "UNKNOWN";
-        ASTNode insertNode = findNode(astTree, "TOK_INSERT_INTO");
-        if (insertNode != null && insertNode.getChildCount() > 0) {
-            Object child = insertNode.getChild(0);
-            if (child instanceof ASTNode) {
-                ASTNode tabNode = (ASTNode) child;
-                String tabToken = tabNode.getToken() != null ? tabNode.getToken().getText() : "";
-                if ("TOK_TAB".equals(tabToken) && tabNode.getChildCount() > 0) {
-                    Object tabNameChild = tabNode.getChild(0);
-                    if (tabNameChild instanceof ASTNode) {
-                        ASTNode tabNameNode = (ASTNode) tabNameChild;
-                        String tabNameToken = tabNameNode.getToken() != null ? tabNameNode.getToken().getText() : "";
-                        if ("TOK_TABNAME".equals(tabNameToken) && tabNameNode.getChildCount() > 0) {
-                            tableName = tabNameNode.getChild(0).toString();
+        // 尝试多种方式查找目标表名
+
+        // 方法1: 查找 TOK_INSERT_INTO (INSERT INTO)
+        ASTNode insertIntoNode = findNode(astTree, "TOK_INSERT_INTO");
+        if (insertIntoNode != null) {
+            String tableName = extractTableNameFromNode(insertIntoNode);
+            if (!"UNKNOWN".equals(tableName)) {
+                return tableName;
+            }
+        }
+
+        // 方法2: 查找 TOK_INSERT (INSERT OVERWRITE)
+        ASTNode insertNode = findNode(astTree, "TOK_INSERT");
+        if (insertNode != null) {
+            // 遍历 TOK_INSERT 的子节点，查找第一个 TOK_TABNAME
+            List<ASTNode> tabNameNodes = findAllNodes(insertNode, "TOK_TABNAME");
+            if (!tabNameNodes.isEmpty()) {
+                String tableName = extractTableNameFromNode(tabNameNodes.get(0));
+                if (!"UNKNOWN".equals(tableName)) {
+                    return tableName;
+                }
+            }
+
+            // 如果没找到 TOK_TABNAME，尝试从子节点中提取
+            if (insertNode.getChildCount() > 0) {
+                for (int i = 0; i < insertNode.getChildCount(); i++) {
+                    Object child = insertNode.getChild(i);
+                    if (child instanceof ASTNode) {
+                        ASTNode childNode = (ASTNode) child;
+                        String childToken = childNode.getToken() != null ? childNode.getToken().getText() : "";
+
+                        // 可能是 TOK_TAB 或 TOK_TABNAME
+                        if ("TOK_TAB".equals(childToken) || "TOK_TABNAME".equals(childToken)) {
+                            String tableName = extractTableNameFromNode(childNode);
+                            if (!"UNKNOWN".equals(tableName)) {
+                                return tableName;
+                            }
+                        }
+                        // 如果是 TOK_TABREF
+                        if ("TOK_TABREF".equals(childToken)) {
+                            String tableName = extractTableNameFromNode(childNode);
+                            if (!"UNKNOWN".equals(tableName)) {
+                                return tableName;
+                            }
                         }
                     }
                 }
             }
         }
-        return tableName;
+
+        // 方法3: 在整个 AST 中查找 TOK_TABNAME（排除 CTE 和 FROM 子句中的）
+        List<ASTNode> allTabNameNodes = findAllNodes(astTree, "TOK_TABNAME");
+        Set<String> cteTableNames = extractCTETableNames(astTree);
+        Set<String> sourceTables = extractSourceTables(astTree, new HashSet<>());
+
+        // 查找不在 CTE 也不是源表的 TOK_TABNAME
+        for (ASTNode tabNameNode : allTabNameNodes) {
+            String tableName = extractTableNameFromNode(tabNameNode);
+            if (!"UNKNOWN".equals(tableName) &&
+                !cteTableNames.contains(tableName) &&
+                !sourceTables.contains(tableName)) {
+                return tableName;
+            }
+        }
+
+        // 如果还是找不到，使用第一个非 CTE 的 TOK_TABNAME
+        for (ASTNode tabNameNode : allTabNameNodes) {
+            String tableName = extractTableNameFromNode(tabNameNode);
+            if (!"UNKNOWN".equals(tableName) && !cteTableNames.contains(tableName)) {
+                return tableName;
+            }
+        }
+
+        return "UNKNOWN";
     }
 
-    private static Set<String> extractSourceTables(ASTNode astTree) {
+    /**
+     * 从节点中提取表名
+     */
+    private static String extractTableNameFromNode(ASTNode node) {
+        if (node == null) {
+            return "UNKNOWN";
+        }
+
+        String tokenText = node.getToken() != null ? node.getToken().getText() : "";
+
+        // 如果已经是 TOK_TABNAME，提取子节点
+        if ("TOK_TABNAME".equals(tokenText)) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < node.getChildCount(); i++) {
+                if (i > 0) sb.append(".");
+                sb.append(node.getChild(i).toString());
+            }
+            return sb.length() > 0 ? sb.toString() : "UNKNOWN";
+        }
+
+        // 如果是 TOK_TAB，递归处理第一个子节点
+        if ("TOK_TAB".equals(tokenText) && node.getChildCount() > 0) {
+            Object child = node.getChild(0);
+            if (child instanceof ASTNode) {
+                return extractTableNameFromNode((ASTNode) child);
+            }
+        }
+
+        // 如果是 TOK_TABREF，处理 TOK_TABNAME 子节点
+        if ("TOK_TABREF".equals(tokenText) && node.getChildCount() > 0) {
+            Object child = node.getChild(0);
+            if (child instanceof ASTNode) {
+                return extractTableNameFromNode((ASTNode) child);
+            }
+        }
+
+        return "UNKNOWN";
+    }
+
+    private static Set<String> extractSourceTables(ASTNode astTree, Set<String> excludeTables) {
         Set<String> tables = new HashSet<>();
         findNode(astTree, "TOK_TABREF", node -> {
             ASTNode tabRefNode = (ASTNode) node;
@@ -367,26 +716,47 @@ public class HiveLineageParser {
                         if (i > 0) sb.append(".");
                         sb.append(tabNameNode.getChild(i).toString());
                     }
-                    tables.add(sb.toString());
+                    String tableName = sb.toString();
+                    // 排除 CTE 表名
+                    if (!excludeTables.contains(tableName)) {
+                        tables.add(tableName);
+                    }
                 }
             }
         });
         return tables;
     }
 
-    private static List<FieldLineage> extractFieldLineages(ASTNode astTree, String targetTable) {
+    private static List<FieldLineage> extractFieldLineages(ASTNode astTree, String targetTable, Set<String> cteTableNames) {
         List<FieldLineage> lineages = new ArrayList<>();
-        Map<String, String> tableAliasMap = buildTableAliasMap(astTree);
 
-        ASTNode selectNode = findNode(astTree, "TOK_SELECT");
-        if (selectNode != null) {
+        // 检查目标表是否是 CTE 表，如果是，则不排除任何表（因为 CTE 查询需要引用其源表）
+        Set<String> excludeTables = cteTableNames.contains(targetTable) ?
+            new HashSet<>() : cteTableNames;
+
+        Map<String, String> tableAliasMap = buildTableAliasMap(astTree, excludeTables);
+
+        // 处理所有 SELECT 节点（支持 UNION、CTE、子查询等）
+        List<ASTNode> selectNodes = findAllNodes(astTree, "TOK_SELECT");
+
+        // 使用 Set 去重，避免 UNION 等场景重复添加相同字段
+        Set<String> processedFields = new HashSet<>();
+
+        for (ASTNode selectNode : selectNodes) {
             for (int i = 0; i < selectNode.getChildCount(); i++) {
                 Object child = selectNode.getChild(i);
                 if (child instanceof ASTNode) {
                     ASTNode selExprNode = (ASTNode) child;
                     String nodeType = selExprNode.getToken() != null ? selExprNode.getToken().getText() : "";
                     if ("TOK_SELEXPR".equals(nodeType)) {
-                        processSelectExpr(selExprNode, targetTable, tableAliasMap, lineages);
+                        // 提取字段名用于去重
+                        String fieldName = extractFieldName(selExprNode);
+                        String key = targetTable + "." + fieldName;
+
+                        // 只处理未重复的字段
+                        if (processedFields.add(key)) {
+                            processSelectExpr(selExprNode, targetTable, tableAliasMap, lineages);
+                        }
                     }
                 }
             }
@@ -395,38 +765,128 @@ public class HiveLineageParser {
         return lineages;
     }
 
-    private static Map<String, String> buildTableAliasMap(ASTNode astTree) {
-        Map<String, String> aliasMap = new HashMap<>();
-        findNode(astTree, "TOK_TABREF", node -> {
-            ASTNode tabRefNode = (ASTNode) node;
-            if (tabRefNode.getChildCount() >= 2) {
-                Object child0 = tabRefNode.getChild(0);
-                if (child0 instanceof ASTNode) {
-                    ASTNode tabNameNode = (ASTNode) child0;
-                    Object aliasChild = tabRefNode.getChild(tabRefNode.getChildCount() - 1);
-                    String alias = aliasChild.toString();
-
-                    StringBuilder fullName = new StringBuilder();
-                    for (int i = 0; i < tabNameNode.getChildCount(); i++) {
-                        if (i > 0) fullName.append(".");
-                        fullName.append(tabNameNode.getChild(i).toString());
-                    }
-                    aliasMap.put(alias, fullName.toString());
-                }
-            } else if (tabRefNode.getChildCount() == 1) {
-                Object child0 = tabRefNode.getChild(0);
-                if (child0 instanceof ASTNode) {
-                    ASTNode tabNameNode = (ASTNode) child0;
-                    StringBuilder fullName = new StringBuilder();
-                    for (int i = 0; i < tabNameNode.getChildCount(); i++) {
-                        if (i > 0) fullName.append(".");
-                        fullName.append(tabNameNode.getChild(i).toString());
-                    }
-                    String tableName = fullName.toString();
-                    aliasMap.put(tableName, tableName);
+    /**
+     * 从 TOK_SELEXPR 节点提取字段名
+     */
+    private static String extractFieldName(ASTNode selExprNode) {
+        if (selExprNode.getChildCount() > 0) {
+            Object lastChild = selExprNode.getChild(selExprNode.getChildCount() - 1);
+            if (lastChild instanceof ASTNode) {
+                ASTNode childNode = (ASTNode) lastChild;
+                String childText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+                // 如果是别名（无子节点且不以 TOK_ 开头）
+                if (childNode.getChildCount() == 0 &&
+                    !childText.startsWith("TOK_") &&
+                    !isOperator(childText)) {
+                    return childText;
                 }
             }
+        }
+        // 没有别名，使用表达式作为字段名
+        return buildExpressionStringFromNode(selExprNode);
+    }
+
+    /**
+     * 从节点构建表达式字符串（简化版）
+     */
+    private static String buildExpressionStringFromNode(ASTNode node) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < node.getChildCount(); i++) {
+            Object child = node.getChild(i);
+            if (child instanceof ASTNode) {
+                ASTNode childNode = (ASTNode) child;
+                String tokenText = childNode.getToken() != null ? childNode.getToken().getText() : "";
+                if (".".equals(tokenText) && childNode.getChildCount() >= 2) {
+                    String left = getNodeText(childNode.getChild(0));
+                    String right = getNodeText(childNode.getChild(1));
+                    sb.append(left).append(".").append(right);
+                } else if ("TOK_TABLE_OR_COL".equals(tokenText) && childNode.getChildCount() > 0) {
+                    sb.append(childNode.getChild(0).toString());
+                } else if (!tokenText.startsWith("TOK_") && childNode.getChildCount() == 0) {
+                    sb.append(tokenText);
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    private static Map<String, String> buildTableAliasMap(ASTNode astTree, Set<String> excludeCteTables) {
+        Map<String, String> aliasMap = new HashMap<>();
+
+        // 先收集所有 TOK_TABREF 节点
+        List<ASTNode> tabRefNodes = new ArrayList<>();
+        findNode(astTree, "TOK_TABREF", node -> {
+            ASTNode tabRefNode = (ASTNode) node;
+            tabRefNodes.add(tabRefNode);
         });
+
+        // 第一步：收集所有可能的表名（包括多级表名的各部分）
+        Map<String, String> fullNameMap = new HashMap<>();
+        for (ASTNode tabRefNode : tabRefNodes) {
+            String fullName = extractTableNameFromNode(tabRefNode);
+
+            // 如果表名包含点（数据库.表格式），添加完整表名和各部分
+            if (fullName.contains(".")) {
+                String[] parts = fullName.split("\\.");
+                String lastPart = parts[parts.length - 1];
+
+                // 添加完整表名
+                fullNameMap.put(fullName, fullName);
+
+                // 添加最后一部分（表名）的引用
+                if (!fullNameMap.containsKey(lastPart)) {
+                    fullNameMap.put(lastPart, fullName);
+                }
+            } else {
+                // 简单表名
+                fullNameMap.put(fullName, fullName);
+            }
+        }
+
+        // 第二步：为每个 TOK_TABREF 构建别名映射
+        for (ASTNode tabRefNode : tabRefNodes) {
+            // 获取完整表名
+            String fullName = null;
+            if (tabRefNode.getChildCount() > 0) {
+                Object child0 = tabRefNode.getChild(0);
+                if (child0 instanceof ASTNode) {
+                    ASTNode tabNameNode = (ASTNode) child0;
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < tabNameNode.getChildCount(); i++) {
+                        if (i > 0) sb.append(".");
+                        sb.append(tabNameNode.getChild(i).toString());
+                    }
+                    fullName = sb.toString();
+                }
+            }
+
+            // 如果是 CTE 表，跳过
+            if (fullName != null && excludeCteTables.contains(fullName)) {
+                continue;
+            }
+
+            // 确定别名
+            String alias;
+            if (tabRefNode.getChildCount() >= 2) {
+                Object aliasChild = tabRefNode.getChild(tabRefNode.getChildCount() - 1);
+                alias = aliasChild.toString();
+            } else if (fullName != null && fullName.contains(".")) {
+                // 对于带数据库前缀的表名，使用最后一部分作为别名
+                alias = fullName.substring(fullName.lastIndexOf('.') + 1);
+            } else {
+                alias = fullName != null ? fullName : "UNKNOWN";
+            }
+
+            // 只有当别名不在 fullNameMap 中时才添加，避免覆盖
+            //（ fullNameMap 中存储的是表名映射，如：表名部分 -> 完整表名）
+            if (!fullNameMap.containsKey(alias) || fullNameMap.get(alias).equals(fullName)) {
+                // 如果别名就是表名本身，或者别名指向的完整表名就是当前表名
+                if (alias.equals(fullName) || (fullName != null && fullNameMap.get(alias) != null && fullNameMap.get(alias).equals(fullName))) {
+                    aliasMap.put(alias, fullName);
+                }
+            }
+        }
+
         return aliasMap;
     }
 
@@ -787,6 +1247,19 @@ public class HiveLineageParser {
         return null;
     }
 
+    /**
+     * 查找所有指定类型的节点并返回列表
+     */
+    private static List<ASTNode> findAllNodes(ASTNode root, String nodeType) {
+        List<ASTNode> results = new ArrayList<>();
+        findNode(root, nodeType, node -> {
+            if (node instanceof ASTNode) {
+                results.add((ASTNode) node);
+            }
+        });
+        return results;
+    }
+
     private static void findNode(ASTNode root, String nodeType, java.util.function.Consumer<Node> callback) {
         if (root == null) {
             return;
@@ -906,7 +1379,7 @@ public class HiveLineageParser {
 
         String[] testSqls = {
             "insert overwrite table hdp_teu_dpd_feature_db.hbg_user_action_log partition(dt = '${dateSuffix}') select imei, userid, pagetype, actiontype, wuxian_data from hdp_teu_dpd_wx_flow.dwd_wx_flow_58app_hbg_and_58local_action_view where dt = '${#date(0,0,-1):yyyyMMdd#}' and cate1 = '1' and actiontype in ('200000006713008400000100','200000006941031200000001','200000005529000100000100','200000005781000100000100')",
-            "CREATE TABLE result AS SELECT user_id, count(*) as cnt FROM source_table GROUP BY user_id",
+            "with entry_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1002' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1002' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'F5143' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'F5143' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1001' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1001' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmshow' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w')),module_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] != '0' and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') union all select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] in ('00','01','02','03','04','05','06','07','08') and datapool['sectionId'] not in ('2027090','1963438','1966403','1966370','2008566')) insert OVERWRITE table hdp_ubu_zhuanzhuan_ads_lux.ads_lux_zz_seckill_detail_inc_1d PARTITION(dt='20260313') select dt stat_date,'入口' type,entry,0 module,token from entry_data union all select dt stat_date,'入口模块' type,entry,module,token from module_data",
             "INSERT INTO target_table SELECT col1, col2 * 2 as double_col2 FROM source_table"
         };
 
