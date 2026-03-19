@@ -1,16 +1,14 @@
 package org.example.utils;
 
-import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
-import org.apache.hadoop.hive.metastore.api.Table;
-import org.apache.hadoop.hive.ql.metadata.Hive;
-import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.parse.ASTNode;
 import org.apache.hadoop.hive.ql.parse.ParseDriver;
 import org.apache.hadoop.hive.ql.parse.ParseException;
 import org.apache.hadoop.hive.ql.lib.Node;
+import org.example.config.HiveConfig;
+import org.springframework.stereotype.Component;
 
+import javax.annotation.Resource;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -23,11 +21,11 @@ import java.util.Set;
  * Hive SQL 字段血缘解析器
  * 基于 Hive Metastore 的字段级别血缘解析，支持绑定元数据验证字段存在性
  */
+@Component
 public class HiveLineageParser {
 
-    private HiveConf hiveConf;
-    private HiveMetaStoreClient metaStoreClient;
-    private boolean connected = false;
+    @Resource
+    private HiveConfig hiveConfig;
 
     // CTE 字段血缘缓存
     private Map<String, Map<String, FieldLineage>> cteFieldCache = new HashMap<>();
@@ -82,112 +80,27 @@ public class HiveLineageParser {
     }
 
     /**
-     * 连接到 Hive Metastore
+     * 解析 Hive SQL（公共方法，模仿 LogicalPlanLineageParser）
      *
-     * @param metastoreUrl Metastore URIs，例如：thrift://localhost:9083
-     * @throws Exception 连接失败时抛出
+     * @param sql Hive SQL 语句
+     * @return 字段名 -> 源字段集合 映射
      */
-    public void connect(String metastoreUrl) throws Exception {
-        hiveConf = new HiveConf();
-        hiveConf.set("hive.metastore.uris", metastoreUrl);
-        hiveConf.setBoolean("hive.support.quoted.identifiers", true);
-        hiveConf.setBoolean("hive.semantic.analyzer.execute", false);
-
+    public Map<String, Set<String>> parse(String sql) {
         try {
-            metaStoreClient = new HiveMetaStoreClient(hiveConf);
-            connected = true;
-            System.out.println("Successfully connected to Hive Metastore: " + metastoreUrl);
+            ParseResult result = parseFieldLineage(sql);
+            Map<String, Set<String>> allSourceFields = getAllSourceFields(
+                result.getFieldLineagesMap(),
+                result.getSqlType()
+            );
+            for (Map.Entry<String, Set<String>> entry : allSourceFields.entrySet()) {
+                System.out.println(entry.getKey() + " → " + entry.getValue());
+            }
+            return allSourceFields;
         } catch (Exception e) {
-            connected = false;
-            throw new Exception("Failed to connect to Hive Metastore: " + e.getMessage(), e);
+            System.err.println("===== Hive SQL 解析失败 =====");
+            System.err.println("错误信息：" + e.getMessage());
+            throw new RuntimeException(e);
         }
-    }
-
-    /**
-     * 使用本地 Hive 实例连接（用于测试或本地模式）
-     */
-    public void connectLocal() throws Exception {
-        try {
-            Hive hive = Hive.get();
-            hiveConf = hive.getConf();
-            connected = true;
-            System.out.println("Connected to local Hive instance");
-        } catch (HiveException e) {
-            throw new Exception("Failed to connect to local Hive: " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 断开连接
-     */
-    public void disconnect() {
-        if (metaStoreClient != null) {
-            metaStoreClient.close();
-            metaStoreClient = null;
-        }
-        connected = false;
-    }
-
-    /**
-     * 检查是否已连接
-     */
-    public boolean isConnected() {
-        return connected && metaStoreClient != null;
-    }
-
-    /**
-     * 获取表的字段信息
-     *
-     * @param tableName 表名，格式：database.table 或 table
-     * @return 字段名到字段信息的映射
-     */
-    public Map<String, FieldSchema> getTableFields(String tableName) throws Exception {
-        if (!isConnected()) {
-            throw new IllegalStateException("Not connected to Metastore");
-        }
-
-        try {
-            String dbName = "default";
-            String tblName = tableName;
-
-            if (tableName.contains(".")) {
-                String[] parts = tableName.split("\\.", 2);
-                dbName = parts[0];
-                tblName = parts[1];
-            }
-
-            Table table = metaStoreClient.getTable(dbName, tblName);
-            if (table == null) {
-                throw new IllegalArgumentException("Table not found: " + tableName);
-            }
-
-            Map<String, FieldSchema> fields = new HashMap<>();
-            for (FieldSchema field : table.getSd().getCols()) {
-                fields.put(field.getName(), field);
-            }
-
-            if (table.getPartitionKeys() != null) {
-                for (FieldSchema field : table.getPartitionKeys()) {
-                    fields.put(field.getName(), field);
-                }
-            }
-
-            return fields;
-        } catch (Exception e) {
-            throw new Exception("Failed to get fields for table " + tableName + ": " + e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 验证字段是否存在
-     *
-     * @param tableName 表名
-     * @param fieldName 字段名
-     * @return 字段信息，如果不存在返回 null
-     */
-    public FieldSchema validateField(String tableName, String fieldName) throws Exception {
-        Map<String, FieldSchema> fields = getTableFields(tableName);
-        return fields.get(fieldName);
     }
 
     /**
@@ -198,8 +111,8 @@ public class HiveLineageParser {
      * @throws IllegalStateException 如果未连接到 Metastore
      */
     public ParseResult parseFieldLineage(String sql) throws ParseException, Exception {
-        if (!isConnected()) {
-            throw new IllegalStateException("必须先连接到 Hive Metastore 才能进行解析。请调用 connect() 方法。");
+        if (!hiveConfig.isConnected()) {
+            throw new IllegalStateException("必须先连接到 Hive Metastore 才能进行解析。");
         }
 
         // 清空 CTE 和子查询缓存
@@ -302,7 +215,7 @@ public class HiveLineageParser {
                 List<FieldLineage> validatedDependencies = new ArrayList<>();
                 for (FieldLineage dependency : filteredDependencies) {
                     try {
-                        FieldSchema sourceFieldSchema = validateField(
+                        FieldSchema sourceFieldSchema = hiveConfig.validateField(
                             dependency.getTableName(),
                             dependency.getFieldName()
                         );
@@ -1090,10 +1003,10 @@ public class HiveLineageParser {
 
                             expandedFields.add(fieldLineage);
                         }
-                    } else if (isConnected()) {
+                    } else if (hiveConfig.isConnected()) {
                         // 从 Metastore 获取真实表的字段
                         try {
-                            Map<String, FieldSchema> tableFields = getTableFields(realTable);
+                            Map<String, FieldSchema> tableFields = hiveConfig.getTableFields(realTable);
                             for (Map.Entry<String, FieldSchema> fieldEntry : tableFields.entrySet()) {
                                 String fieldName = fieldEntry.getKey();
 
@@ -1124,9 +1037,9 @@ public class HiveLineageParser {
         }
 
         // 如果找到了真实表名，从 Metastore 获取所有字段
-        if (tableName != null && isConnected()) {
+        if (tableName != null && hiveConfig.isConnected()) {
             try {
-                Map<String, FieldSchema> tableFields = getTableFields(tableName);
+                Map<String, FieldSchema> tableFields = hiveConfig.getTableFields(tableName);
                 for (Map.Entry<String, FieldSchema> entry : tableFields.entrySet()) {
                     String fieldName = entry.getKey();
 
@@ -1773,45 +1686,17 @@ public class HiveLineageParser {
 
     /**
      * 测试方法
+     * 注意：main 方法不能使用 Spring 注入，仅用于演示
+     * 实际使用时应该通过 Spring 容器获取 bean
      */
     public static void main(String[] args) {
-        HiveLineageParser parser = new HiveLineageParser();
-
-        String[] testSqls = {
-                "select appid,msg_source,split,business,new_session,session_id,info_id,rootcateid,cateid,city,post_user_id,msg_category,ack_time,show_time,original_table,msg_id,time,nvl(t2.merchant_user_id,t1.sender_id) as sender_id,sender_source,sender_info,nvl(t3.merchant_user_id,t1.to_id) as to_id,to_source,to_info,msg_type,show_type,msg_content,options,refer,result,client_version,client_type,sdk_version,os_type,os_version,ip,role,scene,device_info,xxzl_smartid,crypt_to_id,sender_device_id,to_device_id,applet,bg,business_type,cateid_info,sender_id_f,sender_source_f,to_id_f,to_source_f,ack_appid,show_appid,dt from (select t1.* from (select * from hdp_teu_spat_im_defaultdb.im_original_stat_msg where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' and result = '1' and business_type='二手车' and msg_category = 4 and rootcateid = 4) t1 left join (select a.dt,a.msg_id from (select dt,msg_id from hdp_teu_spat_im_defaultdb.im_original_stat_msg where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' and business_type='二手车' and (sender_source = '9999' or to_source = '9999') group by dt,msg_id) a left join (select dt,msg_id from hdp_teu_dpd_viewdb.vw_hdp_teu_spat_wis_msg_a234457 where dt between '${#date(0,0,-2):yyyyMMdd#}' and '${#date(0,0,-1):yyyyMMdd#}' group by dt,msg_id) b on a.dt=b.dt and a.msg_id = b.msg_id where b.msg_id is null) t2 on t1.dt =t2.dt and t1.msg_id=t2.msg_id where t2.msg_id is null) t1 left join (select user_id,merchant_user_id,source from hdp_ershouche_defaultdb.ods_usedcar_db58_cheapi_im_third_user_info_all_d where dt=regexp_replace(date_sub(current_date(),2),'-','') group by user_id,merchant_user_id,source) t2 on t1.sender_id=t2.user_id and t1.sender_source=t2.source left join (select user_id,merchant_user_id,source from hdp_ershouche_defaultdb.ods_usedcar_db58_cheapi_im_third_user_info_all_d where dt=regexp_replace(date_sub(current_date(),2),'-','') group by user_id,merchant_user_id,source) t3 on t1.to_id=t3.user_id and t1.to_source=t3.source",
-            "insert overwrite table hdp_teu_dpd_feature_db.hbg_user_action_log partition(dt = '${dateSuffix}') select imei, userid, pagetype, actiontype, wuxian_data from hdp_teu_dpd_wx_flow.dwd_wx_flow_58app_hbg_and_58local_action_view where dt = '${#date(0,0,-1):yyyyMMdd#}' and cate1 = '1' and actiontype in ('200000006713008400000100','200000006941031200000001','200000005529000100000100','200000005781000100000100')",
-            "with entry_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1002' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1002' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'F5143' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'F5143' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['refpagetype'] = 'G1001' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['refpagetype'] = 'G1001' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmshow' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w')),module_data as (select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] != '0' and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') union all select dt,case when actiontype = 'NMF5645' then '奢品馆-精选-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-包袋-秒杀栏目' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1002%' then '奢品馆-腕表-秒杀栏目' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=2_6_18837_0%' then '包袋频道页-秒杀' when actiontype = 'FMF4721' then '首饰频道页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=2_4_18835_0%' then '腕表频道页-秒杀' when actiontype = 'FMF5404' and datapool['pagequery'] like 'init_from=G1001%' then '包袋TAB页-秒杀' when actiontype = 'WMF7002' then '首饰TAB页-秒杀' when actiontype = 'CMF4799' and datapool['pagequery'] like 'init_from=G1001%' then '腕表TAB页-秒杀' when actiontype = 'FMF5404' then '包袋_秒杀_其它' when actiontype = 'CMF4799' then '腕表_秒杀_其它' else '其它' end entry,case when actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and datapool['sectionId'] in ('2027090','1963438','1966403','1966370','2008566') then '精选橱窗' else datapool['sortName'] end module,token from hdp_zhuanzhuan_dw_global.dw_log_lego_action_1d where dt=20260313 and pagetype = 'zpmclick' and actiontype in ('NMF5645','FMF5404','CMF4799','FMF4721','WMF7002') and region in ('n','f','c','w') and datapool['sortId'] in ('00','01','02','03','04','05','06','07','08') and datapool['sectionId'] not in ('2027090','1963438','1966403','1966370','2008566')) insert OVERWRITE table hdp_ubu_zhuanzhuan_ads_lux.ads_lux_zz_seckill_detail_inc_1d PARTITION(dt='20260313') select dt stat_date,'入口' type,entry,0 module,token from entry_data union all select dt stat_date,'入口模块' type,entry,module,token from module_data",
-            "INSERT INTO target_table SELECT col1, col2 * 2 as double_col2 FROM source_table"
-        };
-
-        try {
-            // 连接到 Metastore
-            String metastoreUrl = "thrift://hdp-metastore-etl.58dns.org:9083";
-            parser.connect(metastoreUrl);
-
-            for (String sql : testSqls) {
-                System.out.println("========================================");
-                System.out.println("SQL: " + sql);
-                System.out.println("========================================");
-                try {
-                    ParseResult result = parser.parseFieldLineage(sql);
-                    System.out.println(result);
-
-                    System.out.println("Source Fields Mapping:");
-                    Map<String, Set<String>> sourceFieldsMap = getAllSourceFields(result.getFieldLineagesMap(), result.getSqlType());
-                    for (Map.Entry<String, Set<String>> entry : sourceFieldsMap.entrySet()) {
-                        System.out.println("  " + entry.getKey() + " → " + entry.getValue());
-                    }
-                } catch (Exception e) {
-                    System.err.println("Error: " + e.getMessage());
-                }
-                System.out.println();
-            }
-        } catch (Exception e) {
-            System.err.println("Failed to connect to Metastore: " + e.getMessage());
-            System.err.println("Please configure the correct Metastore URL.");
-        } finally {
-            parser.disconnect();
-        }
+        System.out.println("注意：HiveLineageParser 现在是 Spring Bean，需要通过 Spring 容器使用。");
+        System.out.println("请在 application.yml 中配置 hive.metastore.uris");
+        System.out.println();
+        System.out.println("示例配置：");
+        System.out.println("hive:");
+        System.out.println("  metastore:");
+        System.out.println("    uris: thrift://localhost:9083");
+        System.out.println("    auto-connect: true");
     }
 }
