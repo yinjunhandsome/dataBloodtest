@@ -26,10 +26,14 @@ public class HiveSqlLineageParser {
 
     // 解析过程中的中间结果
     private List<ParseColumnResult> parseColumnResults = new ArrayList<>();
+    // 临时存储聚合字段的索引，用于后续添加 GROUP BY 字段依赖
+    private List<Integer> aggregateColumnIndexes = new ArrayList<>();
     private List<ParseTableResult> parseTableResults = new ArrayList<>();
     private List<ParseJoinResult> parseJoinResults = new ArrayList<>();
     private List<ParseSubQueryResult> parseSubQueryResults = new ArrayList<>();
     private List<ParseWithResult> parseWithResults = new ArrayList<>();
+    // GROUP BY 字段（用于聚合函数血缘）
+    private Set<String> groupByFields = new HashSet<>();
 
     // FROM tables
     private Set<String> fromTables = new HashSet<>();
@@ -104,10 +108,12 @@ public class HiveSqlLineageParser {
 
     private void clear() {
         parseColumnResults.clear();
+        aggregateColumnIndexes.clear();
         parseTableResults.clear();
         parseJoinResults.clear();
         parseSubQueryResults.clear();
         parseWithResults.clear();
+        groupByFields.clear();
         fromTables.clear();
         targetTable = null;
         targetTableColumns.clear();
@@ -250,7 +256,28 @@ public class HiveSqlLineageParser {
                     String tableName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0).getChild(0));
                     for (ParseWithResult parseWithResult : parseWithResults) {
                         if (parseWithResult.getTableName().equals(tableName)) {
-                            return ProcessWithData.process(parseWithResults);
+                            // 只处理被引用的 CTE，并创建副本避免污染
+                            Map<String, ParseColumnResult> cteResult = new HashMap<>();
+                            String subQueryAliasName = parseWithResult.getAliasName();
+                            if (subQueryAliasName == null) {
+                                subQueryAliasName = parseWithResult.getTableName();
+                            }
+                            Map<String, ParseColumnResult> parseColumnResultMap = parseWithResult.getParseSubQueryResults();
+
+                            for(Map.Entry<String, ParseColumnResult> entry : parseColumnResultMap.entrySet()){
+                                String columnAliasName = entry.getKey();
+                                ParseColumnResult original = entry.getValue();
+
+                                // 创建 ParseColumnResult 的副本
+                                ParseColumnResult copy = new ParseColumnResult();
+                                copy.setAliasName(original.getAliasName());
+                                copy.setIndex(original.getIndex());
+                                copy.setFromTableColumnSet(new HashSet<>(original.getFromTableColumnSet()));
+                                copy.setAggregate(original.isAggregate());
+
+                                cteResult.put(subQueryAliasName + "." + columnAliasName, copy);
+                            }
+                            return cteResult;
                         }
                     }
                 } else {
@@ -303,6 +330,7 @@ public class HiveSqlLineageParser {
                 break;
 
             case HiveParser.TOK_UNIONALL:
+                logger.debug("TOK_UNIONALL: found UNION node");
                 Map<String, ParseColumnResult> newParseColumnResultMap = new HashMap<>();
                 Map<String, ParseColumnResult> leftParseColumnResultMap;
                 Map<String, ParseColumnResult> RightParseColumnResultMap;
@@ -310,23 +338,86 @@ public class HiveSqlLineageParser {
                 if (ast.getChild(0).getType() == HiveParser.TOK_UNIONALL) {
                     leftParseColumnResultMap = parseUnionColumnResults;
                     RightParseColumnResultMap = parseQueryResults.get(0);
+                    logger.debug("TOK_UNIONALL: left is previous UNION (" + leftParseColumnResultMap.size() + " fields), right is new query (" + RightParseColumnResultMap.size() + " fields)");
                 } else {
                     leftParseColumnResultMap = parseQueryResults.get(0);
                     RightParseColumnResultMap = parseQueryResults.get(1);
+                    logger.debug("TOK_UNIONALL: left is query 0 (" + leftParseColumnResultMap.size() + " fields), right is query 1 (" + RightParseColumnResultMap.size() + " fields)");
                 }
 
+                logger.debug("TOK_UNIONALL: left fields = " + leftParseColumnResultMap.keySet());
+                logger.debug("TOK_UNIONALL: right fields = " + RightParseColumnResultMap.keySet());
+
+                // 按照字段名（aliasName）来匹配，而不是 index
                 for (Map.Entry<String, ParseColumnResult> entry : leftParseColumnResultMap.entrySet()) {
                     String columnAliasName = entry.getKey();
-                    ParseColumnResult parseColumnResult = entry.getValue();
-                    int childIndex = parseColumnResult.getIndex();
+                    ParseColumnResult leftColumn = entry.getValue();
 
-                    ParseColumnResult rightColumnResult = getIndexColumnResult(RightParseColumnResultMap, childIndex);
-                    if (rightColumnResult != null) {
-                        Set<String> otherUnionFromColumnSet = rightColumnResult.getFromTableColumnSet();
-                        parseColumnResult.getFromTableColumnSet().addAll(otherUnionFromColumnSet);
+                    logger.debug("TOK_UNIONALL: processing field " + columnAliasName +
+                               ", left lineage=" + leftColumn.getFromTableColumnSet() +
+                               ", left isAggregate=" + leftColumn.isAggregate());
+
+                    // 从右边查找同名字段
+                    ParseColumnResult rightColumn = RightParseColumnResultMap.get(columnAliasName);
+                    if (rightColumn != null) {
+                        Set<String> rightFromColumnSet = rightColumn.getFromTableColumnSet();
+                        boolean rightIsAggregate = rightColumn.isAggregate();
+                        logger.debug("TOK_UNIONALL: found right field " + columnAliasName +
+                                   " with lineage=" + rightFromColumnSet +
+                                   ", right isAggregate=" + rightIsAggregate);
+
+                        // 合并左右两边的血缘
+                        Set<String> mergedFromColumnSet = new HashSet<>(leftColumn.getFromTableColumnSet());
+                        mergedFromColumnSet.addAll(rightFromColumnSet);
+
+                        // 如果任一边是聚合字段，合并后的字段也应该是聚合字段
+                        boolean mergedIsAggregate = leftColumn.isAggregate() || rightIsAggregate;
+
+                        // 创建新的 ParseColumnResult 对象，避免修改原始对象
+                        ParseColumnResult mergedColumn = new ParseColumnResult();
+                        mergedColumn.setAliasName(columnAliasName);
+                        mergedColumn.setIndex(leftColumn.getIndex());
+                        mergedColumn.setFromTableColumnSet(mergedFromColumnSet);
+                        mergedColumn.setAggregate(mergedIsAggregate);
+
+                        logger.debug("TOK_UNIONALL: merged lineage for " + columnAliasName +
+                                   " = " + mergedFromColumnSet +
+                                   ", merged isAggregate=" + mergedIsAggregate);
+                        newParseColumnResultMap.put(columnAliasName, mergedColumn);
+                    } else {
+                        logger.warn("TOK_UNIONALL: right field " + columnAliasName + " not found in right fields: " + RightParseColumnResultMap.keySet());
+                        // 右边没有该字段，直接使用左边的（创建副本）
+                        ParseColumnResult copyColumn = new ParseColumnResult();
+                        copyColumn.setAliasName(columnAliasName);
+                        copyColumn.setIndex(leftColumn.getIndex());
+                        copyColumn.setFromTableColumnSet(new HashSet<>(leftColumn.getFromTableColumnSet()));
+                        copyColumn.setAggregate(leftColumn.isAggregate());
+                        newParseColumnResultMap.put(columnAliasName, copyColumn);
                     }
-                    newParseColumnResultMap.put(columnAliasName, parseColumnResult);
                 }
+
+                // 处理右边有但左边没有的字段
+                for (Map.Entry<String, ParseColumnResult> entry : RightParseColumnResultMap.entrySet()) {
+                    String columnAliasName = entry.getKey();
+                    if (!newParseColumnResultMap.containsKey(columnAliasName)) {
+                        logger.debug("TOK_UNIONALL: processing right-only field " + columnAliasName +
+                                   ", right lineage=" + entry.getValue().getFromTableColumnSet());
+                        // 创建副本
+                        ParseColumnResult copyColumn = new ParseColumnResult();
+                        copyColumn.setAliasName(columnAliasName);
+                        copyColumn.setIndex(entry.getValue().getIndex());
+                        copyColumn.setFromTableColumnSet(new HashSet<>(entry.getValue().getFromTableColumnSet()));
+                        copyColumn.setAggregate(entry.getValue().isAggregate());
+                        newParseColumnResultMap.put(columnAliasName, copyColumn);
+                    }
+                }
+
+                logger.debug("TOK_UNIONALL: final merged fields = " + newParseColumnResultMap.keySet());
+                for (Map.Entry<String, ParseColumnResult> entry : newParseColumnResultMap.entrySet()) {
+                    logger.debug("TOK_UNIONALL:   " + entry.getKey() + " -> " + entry.getValue().getFromTableColumnSet() +
+                               " (isAggregate=" + entry.getValue().isAggregate() + ")");
+                }
+
                 parseUnionColumnResults.putAll(newParseColumnResultMap);
                 parseQueryResults.clear();
                 break;
@@ -444,10 +535,81 @@ public class HiveSqlLineageParser {
                 } else {
                     ProcessTokSelexpr processTokSelexpr = new ProcessTokSelexpr();
                     processTokSelexpr.setParseFromResult(parseFromResult);
+                    processTokSelexpr.setGroupByFields(groupByFields);
                     ParseColumnResult parseColumnResult = processTokSelexpr.process(ast);
                     logger.debug("TOK_SELEXPR: " + parseColumnResult);
+                    // 如果是聚合函数，记录索引以便后续添加 GROUP BY 字段依赖
+                    if (parseColumnResult.isAggregate()) {
+                        aggregateColumnIndexes.add(parseColumnResults.size());
+                        logger.debug("TOK_SELEXPR: Found aggregate field at index " + parseColumnResults.size());
+                    }
                     parseColumnResults.add(parseColumnResult);
                 }
+                break;
+
+            case HiveParser.TOK_GROUPBY:
+                // 处理 GROUP BY 子句，收集 Group By 字段
+                groupByFields.clear();
+                logger.debug("TOK_GROUPBY: child count = " + ast.getChildCount());
+                for (int i = 0; i < ast.getChildCount(); i++) {
+                    ASTNode groupByExpr = (ASTNode) ast.getChild(i);
+                    logger.debug("TOK_GROUPBY: child " + i + " type = " + groupByExpr.getType() +
+                               " (" + groupByExpr.getText() + ")");
+
+                    Set<String> groupByColumnSet = new HashSet<>();
+
+                    // 检查是否是数字常量（GROUP BY 位置引用，如 GROUP BY 1, 2, 3）
+                    if (groupByExpr.getType() == HiveParser.Number) {
+                        // 获取数字（1-based）
+                        String positionStr = groupByExpr.getText();
+                        try {
+                            int position = Integer.parseInt(positionStr);
+                            // 从 parseColumnResults 中获取对应位置的字段血缘
+                            if (position > 0 && position <= parseColumnResults.size()) {
+                                ParseColumnResult referencedColumn = parseColumnResults.get(position - 1);
+                                groupByColumnSet = referencedColumn.getFromTableColumnSet();
+                                logger.debug("TOK_GROUPBY: child " + i + " is position reference to " +
+                                           referencedColumn.getAliasName() + ", extracted columns: " + groupByColumnSet);
+                            } else {
+                                logger.warn("TOK_GROUPBY: invalid position " + position +
+                                          ", valid range is 1-" + parseColumnResults.size());
+                            }
+                        } catch (NumberFormatException e) {
+                            logger.warn("TOK_GROUPBY: failed to parse position: " + positionStr);
+                        }
+                    } else {
+                        // 常规的字段引用，使用 parseSelect 提取
+                        ProcessTokSelexpr groupByProcessor = new ProcessTokSelexpr();
+                        groupByProcessor.setParseFromResult(parseFromResult);
+                        groupByColumnSet = groupByProcessor.parseSelect(groupByExpr);
+                        logger.debug("TOK_GROUPBY: child " + i + " extracted columns: " + groupByColumnSet);
+                    }
+
+                    // 添加到 groupByFields 中（用于聚合函数血缘）
+                    groupByFields.addAll(groupByColumnSet);
+                }
+                logger.debug("TOK_GROUPBY: collected " + groupByFields.size() + " group by fields: " + groupByFields);
+
+                // 回过头来更新之前记录的聚合字段的血缘，添加 GROUP BY 字段作为依赖
+                if (!groupByFields.isEmpty() && !aggregateColumnIndexes.isEmpty()) {
+                    for (int aggIndex : aggregateColumnIndexes) {
+                        if (aggIndex < parseColumnResults.size()) {
+                            ParseColumnResult aggColumn = parseColumnResults.get(aggIndex);
+                            logger.debug("TOK_GROUPBY: Adding GROUP BY fields to aggregate field " +
+                                       aggColumn.getAliasName() + " at index " + aggIndex +
+                                       ", current fromTableColumnSet=" + aggColumn.getFromTableColumnSet());
+
+                            // 添加所有 GROUP BY 字段
+                            aggColumn.getFromTableColumnSet().addAll(groupByFields);
+
+                            logger.debug("TOK_GROUPBY: After adding GROUP BY fields, fromTableColumnSet=" +
+                                       aggColumn.getFromTableColumnSet());
+                        }
+                    }
+                }
+
+                // 清空聚合字段索引列表，为下一个查询准备
+                aggregateColumnIndexes.clear();
                 break;
 
             default:

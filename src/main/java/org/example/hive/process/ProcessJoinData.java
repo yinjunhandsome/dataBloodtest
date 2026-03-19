@@ -27,10 +27,30 @@ public class ProcessJoinData {
                 List<ParseSubQueryResult> parseSubQueryResults = parseJoinResult.getParseSubQueryResults();
                 parseFromResult.putAll(ProcessSubQueryData.process(parseSubQueryResults));
             }
-            // 处理 WITH
+            // 处理 WITH - 创建副本避免污染原始数据
             if (parseJoinResult.getParseWithResults() != null) {
-                List<ParseWithResult> parseWiteResults = parseJoinResult.getParseWithResults();
-                parseFromResult.putAll(ProcessWithData.process(parseWiteResults));
+                List<ParseWithResult> parseWithResults = parseJoinResult.getParseWithResults();
+                for (ParseWithResult parseWithResult : parseWithResults) {
+                    String subQueryAliasName = parseWithResult.getAliasName();
+                    if (subQueryAliasName == null) {
+                        subQueryAliasName = parseWithResult.getTableName();
+                    }
+                    Map<String, ParseColumnResult> parseColumnResultMap = parseWithResult.getParseSubQueryResults();
+
+                    for(Map.Entry<String, ParseColumnResult> entry : parseColumnResultMap.entrySet()){
+                        String columnAliasName = entry.getKey();
+                        ParseColumnResult original = entry.getValue();
+
+                        // 创建 ParseColumnResult 的副本
+                        ParseColumnResult copy = new ParseColumnResult();
+                        copy.setAliasName(original.getAliasName());
+                        copy.setIndex(original.getIndex());
+                        copy.setFromTableColumnSet(new java.util.HashSet<>(original.getFromTableColumnSet()));
+                        copy.setAggregate(original.isAggregate());
+
+                        parseFromResult.put(subQueryAliasName + "." + columnAliasName, copy);
+                    }
+                }
             }
         }
         return parseFromResult;

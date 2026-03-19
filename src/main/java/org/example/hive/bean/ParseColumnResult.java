@@ -9,4 +9,6 @@ public class ParseColumnResult {
     private String aliasName;
     private int index;
     private Set<String> fromTableColumnSet;
+    // 标记是否是聚合函数
+    private boolean isAggregate;
 }
