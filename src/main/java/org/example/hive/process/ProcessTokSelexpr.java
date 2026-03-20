@@ -33,6 +33,7 @@ public class ProcessTokSelexpr {
             }
             if (columnName.equals(column)) {
                 parseColumnResult = entity.getValue();
+                break;
             }
         }
         return parseColumnResult;
@@ -41,7 +42,6 @@ public class ProcessTokSelexpr {
     public Set<String> parseSelect(ASTNode ast) {
         // 依赖的字段列表
         Set<String> fromColumns = new TreeSet();
-
         if (ast.getType() == HiveParser.DOT && ast.getChild(0).getType() == HiveParser.TOK_TABLE_OR_COL
                 && ast.getChild(0).getChildCount() == 1 && ast.getChild(1).getType() == HiveParser.Identifier) {
             // 字段 有别名
@@ -61,6 +61,71 @@ public class ProcessTokSelexpr {
             ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
             if (parseColumnResult != null) {
                 fromColumns.addAll(parseColumnResult.getFromTableColumnSet());
+            }
+        } else if (ast.getType() == HiveParser.DOT && ast.getChildCount() == 2
+                && "[".equals(ast.getChild(1).getText())) {
+            // 数组/Map 字段访问的另一种形式：TOK_SELEXPR -> DOT -> (TOK_TABLE_OR_COL datapool, [)
+            // 这种情况下，ast 是 DOT 节点，第一个子节点是字段引用，第二个子节点是 [
+            ASTNode firstChild = (ASTNode) ast.getChild(0);
+            if (firstChild.getType() == HiveParser.TOK_TABLE_OR_COL && firstChild.getChildCount() == 1) {
+                String column = extractColumnNameFromNode(firstChild);
+                if (column == null) {
+                    column = BaseSemanticAnalyzer.getUnescapedName(firstChild);
+                }
+                ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
+                if (parseColumnResult != null) {
+                    fromColumns.addAll(parseColumnResult.getFromTableColumnSet());
+                    logger.debug("parseSelect: Found array/map field access (DOT form): " + column + "[...], lineage: " + parseColumnResult.getFromTableColumnSet());
+                }
+            }
+        } else if (ast.getChildCount() > 0) {
+            logger.debug("parseSelect: node has " + ast.getChildCount() + " children, processing recursively");
+            ASTNode firstChild = (ASTNode) ast.getChild(0);
+            // 检查是否是数组/Map 访问：子节点是 [ 节点（通过文本或类型判断）
+            boolean isBracketNode = "[".equals(firstChild.getText());
+            // 也尝试通过类型判断（HiveParser 中可能有 LSQUARE 或类似的类型）
+            if (!isBracketNode && firstChild.getChildCount() > 0) {
+                // 检查第一个子节点的第一个子节点是否是 TOK_TABLE_OR_COL，且父节点看起来像是 [ 访问
+                ASTNode grandChild = (ASTNode) firstChild.getChild(0);
+                if (grandChild != null && grandChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                    // 很可能是数组/Map 访问
+                    isBracketNode = true;
+                    logger.debug("parseSelect: Detected bracket node by structure, firstChild type=" + firstChild.getType() + ", text='" + firstChild.getText() + "'");
+                }
+            }
+
+            if (isBracketNode) {
+                // 数组/Map 字段访问，例如：datapool['sortName'] 或 array[0]
+                // AST 结构是：TOK_SELEXPR -> [ -> (TOK_TABLE_OR_COL datapool, 'sortName')
+                logger.debug("parseSelect: Detected bracket node, childCount=" + firstChild.getChildCount());
+                if (firstChild.getChildCount() >= 1) {
+                    ASTNode bracketFirstChild = (ASTNode) firstChild.getChild(0);
+                    logger.debug("parseSelect: bracketFirstChild type=" + bracketFirstChild.getType() + ", text='" + bracketFirstChild.getText() + "'");
+                    // 处理字段部分 (如 datapool)
+                    if (bracketFirstChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                        String column = extractColumnNameFromNode(bracketFirstChild);
+                        if (column == null) {
+                            column = BaseSemanticAnalyzer.getUnescapedName(bracketFirstChild);
+                        }
+                        logger.debug("parseSelect: Extracted column name from bracket: " + column);
+                        ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
+                        if (parseColumnResult != null) {
+                            fromColumns.addAll(parseColumnResult.getFromTableColumnSet());
+                            logger.debug("parseSelect: Found array/map field access: " + column + "[...], lineage: " + parseColumnResult.getFromTableColumnSet());
+                        } else {
+                            logger.warn("parseSelect: ParseColumnResult is null for column: " + column);
+                        }
+                    } else {
+                        // 递归处理第一个子节点
+                        fromColumns.addAll(parseSelect(bracketFirstChild));
+                    }
+                }
+            } else {
+                // 递归处理所有子节点
+                int cnt = ast.getChildCount();
+                for (int i = 0; i < cnt; i++) {
+                    fromColumns.addAll(parseSelect((ASTNode) ast.getChild(i)));
+                }
             }
         } else {
             int cnt = ast.getChildCount();
@@ -132,6 +197,60 @@ public class ProcessTokSelexpr {
             ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
             if (parseColumnResult != null) {
                 fields.addAll(parseColumnResult.getFromTableColumnSet());
+            }
+        } else if (ast.getType() == HiveParser.DOT && ast.getChildCount() == 2
+                && "[".equals(ast.getChild(1).getText())) {
+            // 数组/Map 字段访问的另一种形式：ast 是 DOT 节点
+            // 例如：datapool['sortName'] 的 AST 结构可能是 DOT -> (TOK_TABLE_OR_COL datapool, [)
+            ASTNode firstChild = (ASTNode) ast.getChild(0);
+            if (firstChild.getType() == HiveParser.TOK_TABLE_OR_COL && firstChild.getChildCount() == 1) {
+                String column = extractColumnNameFromNode(firstChild);
+                if (column == null) {
+                    column = BaseSemanticAnalyzer.getUnescapedName(firstChild);
+                }
+                ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
+                if (parseColumnResult != null) {
+                    fields.addAll(parseColumnResult.getFromTableColumnSet());
+                    logger.debug("extractFieldsFromExpression: Found array/map field access (DOT form): " + column + "[...], lineage: " + parseColumnResult.getFromTableColumnSet());
+                }
+            }
+        } else if (ast.getChildCount() > 0) {
+            ASTNode firstChild = (ASTNode) ast.getChild(0);
+            // 检查是否是数组/Map 访问
+            boolean isBracketNode = "[".equals(firstChild.getText());
+            if (!isBracketNode && firstChild.getChildCount() > 0) {
+                ASTNode grandChild = (ASTNode) firstChild.getChild(0);
+                if (grandChild != null && grandChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                    isBracketNode = true;
+                    logger.debug("extractFieldsFromExpression: Detected bracket node by structure");
+                }
+            }
+
+            if (isBracketNode) {
+                // 数组/Map 字段访问，例如：datapool['sortName']
+                if (firstChild.getChildCount() >= 1) {
+                    ASTNode bracketFirstChild = (ASTNode) firstChild.getChild(0);
+                    if (bracketFirstChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                        String column = extractColumnNameFromNode(bracketFirstChild);
+                        if (column == null) {
+                            column = BaseSemanticAnalyzer.getUnescapedName(bracketFirstChild);
+                        }
+                        ParseColumnResult parseColumnResult = getResultByColumn(parseFromResult, column);
+                        if (parseColumnResult != null) {
+                            fields.addAll(parseColumnResult.getFromTableColumnSet());
+                            logger.debug("extractFieldsFromExpression: Found array/map field access: " + column + "[...], lineage: " + parseColumnResult.getFromTableColumnSet());
+                        }
+                    } else {
+                        fields.addAll(extractFieldsFromExpression(bracketFirstChild));
+                    }
+                }
+            } else if (!(ast.getType() == HiveParser.TOK_FUNCTION ||
+                        ast.getType() == HiveParser.TOK_FUNCTIONDI ||
+                        ast.getType() == HiveParser.TOK_FUNCTIONSTAR)) {
+                // 对于非聚合函数节点，递归处理子节点
+                for (int i = 0; i < ast.getChildCount(); i++) {
+                    fields.addAll(extractFieldsFromExpression((ASTNode) ast.getChild(i)));
+                }
             }
         } else if (!(ast.getType() == HiveParser.TOK_FUNCTION ||
                     ast.getType() == HiveParser.TOK_FUNCTIONDI ||
@@ -226,6 +345,21 @@ public class ProcessTokSelexpr {
         } else if (childAst.getToken().getType() == HiveParser.TOK_TABLE_OR_COL) {
             // select column
             columnAliasName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) childAst.getChild(0));
+        } else if (childAst.getChildCount() > 0) {
+            // 检查是否是数组/Map访问: datapool['sortName']
+            ASTNode firstChild = (ASTNode) childAst.getChild(0);
+            if ("[".equals(firstChild.getText()) || firstChild.getChildCount() > 0) {
+                // 对于括号表达式，找到被访问的字段名
+                String baseColumn = extractColumnNameFromNode(childAst);
+                if (baseColumn != null && !baseColumn.isEmpty()) {
+                    columnAliasName = baseColumn;
+                } else {
+                    columnAliasName = "col_" + childIndex;
+                }
+            } else {
+                // 使用的元数据获取到的 insert table 的字段
+                columnAliasName = "col_" + childIndex;
+            }
         } else {
             // 使用的元数据获取到的 insert table 的字段
             columnAliasName = "col_" + childIndex;
@@ -233,12 +367,71 @@ public class ProcessTokSelexpr {
         return columnAliasName;
     }
 
+    /**
+     * 从AST节点中提取列名，处理各种情况包括数组/Map访问
+     */
+    private String extractColumnNameFromNode(ASTNode node) {
+        if (node == null) {
+            return null;
+        }
+
+        // 如果节点本身就是括号表达式
+        if ("[".equals(node.getText()) && node.getChildCount() >= 1) {
+            ASTNode bracketFirstChild = (ASTNode) node.getChild(0);
+            if (bracketFirstChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                return extractColumnNameFromNode(bracketFirstChild);
+            }
+        }
+
+        // 处理 TOK_TABLE_OR_COL 节点
+        if (node.getType() == HiveParser.TOK_TABLE_OR_COL && node.getChildCount() == 1) {
+            ASTNode child = (ASTNode) node.getChild(0);
+            if (child.getType() == HiveParser.Identifier) {
+                return BaseSemanticAnalyzer.getUnescapedName(child);
+            }
+        }
+
+        // 处理括号表达式: datapool['sortName']
+        if (node.getChildCount() > 0) {
+            ASTNode firstChild = (ASTNode) node.getChild(0);
+            if ("[".equals(firstChild.getText())) {
+                // 括号表达式，获取括号前的字段名
+                if (firstChild.getChildCount() >= 1) {
+                    ASTNode bracketFirstChild = (ASTNode) firstChild.getChild(0);
+                    if (bracketFirstChild.getType() == HiveParser.TOK_TABLE_OR_COL) {
+                        return extractColumnNameFromNode(bracketFirstChild);
+                    }
+                }
+            }
+        }
+
+        // 递归处理子节点
+        for (int i = 0; i < node.getChildCount(); i++) {
+            String result = extractColumnNameFromNode((ASTNode) node.getChild(i));
+            if (result != null && !result.isEmpty()) {
+                return result;
+            }
+        }
+
+        return null;
+    }
+
     private boolean hasAllcolref(ASTNode ast) {
         boolean flag = false;
-        for (int i = 0; i < ast.getParent().getChildCount() - ast.getChildIndex(); i++) {
-            if (ast.getParent().getChild(i).getChild(0).getType() == HiveParser.TOK_ALLCOLREF) {
-                flag = true;
-                break;
+        ASTNode parent = (ASTNode) ast.getParent();
+        if (parent == null) {
+            return flag;
+        }
+
+        for (int i = 0; i < parent.getChildCount() - ast.getChildIndex(); i++) {
+            ASTNode sibling = (ASTNode) parent.getChild(i);
+            // Check if sibling has at least one child before accessing it
+            if (sibling != null && sibling.getChildCount() > 0) {
+                ASTNode firstChild = (ASTNode) sibling.getChild(0);
+                if (firstChild != null && firstChild.getType() == HiveParser.TOK_ALLCOLREF) {
+                    flag = true;
+                    break;
+                }
             }
         }
         return flag;

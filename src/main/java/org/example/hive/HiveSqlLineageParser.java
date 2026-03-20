@@ -49,6 +49,10 @@ public class HiveSqlLineageParser {
     private Map<String, ParseColumnResult> parseLateralViewResult = new HashMap<>();
     private Map<String, ParseColumnResult> parseAllColref = new HashMap<>();
 
+    // 存储已处理的子查询结果，即使 parseSubQueryResults 被清空，这个 Map 也会保留子查询信息
+    // Key: 子查询别名, Value: 子查询的字段信息
+    private Map<String, Map<String, ParseColumnResult>> processedSubQueries = new HashMap<>();
+
     // 最终的血缘结果
     private Map<String, Set<String>> lineageData = new HashMap<>();
 
@@ -123,6 +127,7 @@ public class HiveSqlLineageParser {
         parseFromResult.clear();
         parseLateralViewResult.clear();
         parseAllColref.clear();
+        processedSubQueries.clear();
         lineageData.clear();
     }
 
@@ -220,22 +225,72 @@ public class HiveSqlLineageParser {
                 ast.getToken().getType() == HiveParser.TOK_LATERAL_VIEW_OUTER)) {
             parseASTNode((ASTNode) ast.getChild(1));
             parseASTNode((ASTNode) ast.getChild(0));
-        } else if (ast.getToken() != null && ast.getToken().getType() == HiveParser.TOK_QUERY &&
-                ast.getChild(2) != null && ast.getChild(2).getType() == HiveParser.TOK_CTE) {
-            for (int i = 0; i < ast.getChild(2).getChildCount(); i++) {
-                parseASTNode((ASTNode) ast.getChild(2).getChild(i));
-                for (int j = i; j < parseSubQueryResults.size(); j++) {
-                    ParseWithResult parseWithResult = new ParseWithResult();
-                    parseWithResult.setTableName(parseSubQueryResults.get(i).getAliasName());
-                    Map<String, ParseColumnResult> parseSubQueryResultTmp = new HashMap<>();
-                    parseSubQueryResultTmp.putAll(parseSubQueryResults.get(i).getParseSubQueryResults());
-                    parseWithResult.setParseSubQueryResults(parseSubQueryResultTmp);
-                    parseWithResults.add(parseWithResult);
+        } else if (ast.getToken() != null && ast.getToken().getType() == HiveParser.TOK_QUERY) {
+            // 添加调试日志：打印 TOK_QUERY 的子节点信息
+            logger.debug("parseChildASTNode: TOK_QUERY found, childCount=" + ast.getChildCount());
+            for (int i = 0; i < ast.getChildCount(); i++) {
+                ASTNode child = (ASTNode) ast.getChild(i);
+                if (child != null) {
+                    String tokenName = "";
+                    try {
+                        tokenName = HiveParser.tokenNames[child.getType()];
+                    } catch (Exception e) {
+                        tokenName = "UNKNOWN";
+                    }
+                    logger.debug("parseChildASTNode: TOK_QUERY child[" + i + "] type=" + child.getType() +
+                               " (" + child.getText() + "), tokenName=" + tokenName);
                 }
             }
-            parseSubQueryResults.clear();
-            parseASTNode((ASTNode) ast.getChild(0));
-            parseASTNode((ASTNode) ast.getChild(1));
+
+            // Search for TOK_CTE in any child position
+            ASTNode cteNode = null;
+            for (int i = 0; i < ast.getChildCount(); i++) {
+                if (ast.getChild(i) != null && ast.getChild(i).getType() == HiveParser.TOK_CTE) {
+                    cteNode = (ASTNode) ast.getChild(i);
+                    logger.debug("parseChildASTNode: Found TOK_CTE at child index " + i);
+                    break;
+                }
+            }
+            if (cteNode != null) {
+                logger.debug("parseChildASTNode: Found TOK_QUERY with TOK_CTE, CTE count=" + cteNode.getChildCount());
+                // 记录处理 CTE 前的子查询数量
+                int initialSubQueryCount = parseSubQueryResults.size();
+                logger.debug("parseChildASTNode: Initial parseSubQueryResults.size()=" + initialSubQueryCount);
+                for (int i = 0; i < cteNode.getChildCount(); i++) {
+                    logger.debug("parseChildASTNode: Processing CTE #" + i);
+                    parseASTNode((ASTNode) cteNode.getChild(i));
+                    logger.debug("parseChildASTNode: After parsing CTE #" + i + ", parseSubQueryResults.size()=" + parseSubQueryResults.size());
+                    // 只添加新解析的子查询结果（避免重复添加）
+                    for (int j = initialSubQueryCount; j < parseSubQueryResults.size(); j++) {
+                        ParseWithResult parseWithResult = new ParseWithResult();
+                        parseWithResult.setTableName(parseSubQueryResults.get(j).getAliasName());
+                        Map<String, ParseColumnResult> parseSubQueryResultTmp = new HashMap<>();
+                        parseSubQueryResultTmp.putAll(parseSubQueryResults.get(j).getParseSubQueryResults());
+                        parseWithResult.setParseSubQueryResults(parseSubQueryResultTmp);
+                        parseWithResults.add(parseWithResult);
+                        logger.debug("Added CTE to parseWithResults: " + parseWithResult.getTableName() +
+                                   " with " + parseSubQueryResultTmp.size() + " fields");
+                    }
+                    // 更新起始位置，为下一个 CTE 做准备
+                    initialSubQueryCount = parseSubQueryResults.size();
+                }
+                logger.debug("parseChildASTNode: Finished processing all CTEs, parseWithResults.size()=" + parseWithResults.size());
+                parseSubQueryResults.clear();
+                logger.debug("parseChildASTNode: Cleared parseSubQueryResults");
+                logger.debug("parseChildASTNode: Now parsing main query (non-CTE children)");
+                // Parse all non-CTE children
+                for (int i = 0; i < ast.getChildCount(); i++) {
+                    if (ast.getChild(i) != null && ast.getChild(i).getType() != HiveParser.TOK_CTE) {
+                        parseASTNode((ASTNode) ast.getChild(i));
+                    }
+                }
+            } else {
+                // No CTE found, parse all children normally
+                int childCount = ast.getChildCount();
+                for (int i = 0; i < childCount; i++) {
+                    parseASTNode((ASTNode) ast.getChild(i));
+                }
+            }
         } else {
             int childCount = ast.getChildCount();
             for (int i = 0; i < childCount; i++) {
@@ -252,10 +307,83 @@ public class HiveSqlLineageParser {
                 return result;
 
             case HiveParser.TOK_TABREF:
+                // 获取表名或别名
+                String tableNameOrAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0).getChild(0));
+
+                // 获取别名（如果有的话）
+                String tableAlias;
+                if (ast.getChild(1) != null) {
+                    tableAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(1));
+                } else {
+                    tableAlias = tableNameOrAlias;
+                }
+
+                // 检查是否是子查询别名（通过 tableNameOrAlias 或 tableAlias 匹配）
+                ParseSubQueryResult matchedSubQuery = null;
+
+                // 首先检查 parseSubQueryResults（当前正在处理的子查询）
+                for (ParseSubQueryResult subQueryResult : parseSubQueryResults) {
+                    if (subQueryResult.getAliasName().equals(tableNameOrAlias) ||
+                        subQueryResult.getAliasName().equals(tableAlias)) {
+                        matchedSubQuery = subQueryResult;
+                        break;
+                    }
+                }
+
+                // 如果在 parseSubQueryResults 中没找到，检查 processedSubQueries（已处理的子查询）
+                if (matchedSubQuery == null) {
+                    Map<String, ParseColumnResult> processedResult = processedSubQueries.get(tableNameOrAlias);
+                    if (processedResult != null) {
+                        matchedSubQuery = new ParseSubQueryResult();
+                        matchedSubQuery.setAliasName(tableNameOrAlias);
+                        matchedSubQuery.setParseSubQueryResults(new HashMap<>(processedResult));
+                        logger.debug("TOK_TABREF: Found in processedSubQueries for " + tableNameOrAlias + " with " + processedResult.size() + " fields");
+                    }
+                }
+
+                // 如果还是没找到，尝试检查 parseQueryResults（向后兼容）
+                if (matchedSubQuery == null && !parseQueryResults.isEmpty()) {
+                    logger.debug("TOK_TABREF: Not found in parseSubQueryResults or processedSubQueries, checking parseQueryResults for " + tableNameOrAlias);
+                    for (int i = parseQueryResults.size() - 1; i >= 0; i--) {
+                        Map<String, ParseColumnResult> queryResult = parseQueryResults.get(i);
+                        if (!queryResult.isEmpty()) {
+                            matchedSubQuery = new ParseSubQueryResult();
+                            matchedSubQuery.setAliasName(tableNameOrAlias);
+                            matchedSubQuery.setParseSubQueryResults(new HashMap<>(queryResult));
+                            logger.debug("TOK_TABREF: Found in parseQueryResults[" + i + "], created temporary subquery with " + queryResult.size() + " fields");
+                            break;
+                        }
+                    }
+                }
+
+                // 如果找到匹配的子查询，返回其字段信息
+                if (matchedSubQuery != null) {
+                    Map<String, ParseColumnResult> subQueryResultMap = new HashMap<>();
+                    Map<String, ParseColumnResult> parseColumnResultMap = matchedSubQuery.getParseSubQueryResults();
+
+                    for (Map.Entry<String, ParseColumnResult> entry : parseColumnResultMap.entrySet()) {
+                        String columnAliasName = entry.getKey();
+                        ParseColumnResult original = entry.getValue();
+
+                        // 创建 ParseColumnResult 的副本
+                        ParseColumnResult copy = new ParseColumnResult();
+                        copy.setAliasName(original.getAliasName());
+                        copy.setIndex(original.getIndex());
+                        copy.setFromTableColumnSet(new HashSet<>(original.getFromTableColumnSet()));
+                        copy.setAggregate(original.isAggregate());
+
+                        // 使用 TOK_TABREF 的别名作为前缀
+                        subQueryResultMap.put(tableAlias + "." + columnAliasName, copy);
+                    }
+                    return subQueryResultMap;
+                }
+
                 if (ast.getChild(0).getChildCount() == 1) {
-                    String tableName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0).getChild(0));
+                    // 无数据库名的情况，检查是否是 CTE
+                    boolean found = false;
+
                     for (ParseWithResult parseWithResult : parseWithResults) {
-                        if (parseWithResult.getTableName().equals(tableName)) {
+                        if (parseWithResult.getTableName().equals(tableNameOrAlias)) {
                             // 只处理被引用的 CTE，并创建副本避免污染
                             Map<String, ParseColumnResult> cteResult = new HashMap<>();
                             String subQueryAliasName = parseWithResult.getAliasName();
@@ -277,8 +405,16 @@ public class HiveSqlLineageParser {
 
                                 cteResult.put(subQueryAliasName + "." + columnAliasName, copy);
                             }
+                            found = true;
                             return cteResult;
                         }
+                    }
+
+                    // 如果既不是 CTE 也不是子查询别名，按普通表处理
+                    if (!found) {
+                        Map<String, ParseColumnResult> tabrefResult = ProcessTabrefData.process(parseTableResults);
+                        parseTableResults.clear();
+                        return tabrefResult;
                     }
                 } else {
                     Map<String, ParseColumnResult> tabrefResult = ProcessTabrefData.process(parseTableResults);
@@ -291,7 +427,7 @@ public class HiveSqlLineageParser {
             case HiveParser.TOK_LEFTOUTERJOIN:
             case HiveParser.TOK_JOIN:
             case HiveParser.TOK_LEFTSEMIJOIN:
-            case HiveParser.TOK_MAPJOIN:
+//            case HiveParser.TOK_MAPJOIN:
             case HiveParser.TOK_FULLOUTERJOIN:
             case HiveParser.TOK_UNIQUEJOIN:
                 Map<String, ParseColumnResult> joinResult = ProcessJoinData.process(parseJoinResults);
@@ -331,6 +467,30 @@ public class HiveSqlLineageParser {
 
             case HiveParser.TOK_UNIONALL:
                 logger.debug("TOK_UNIONALL: found UNION node");
+                // 添加调试信息：打印 AST 结构
+                logger.debug("TOK_UNIONALL: AST childCount=" + ast.getChildCount());
+                for (int i = 0; i < ast.getChildCount(); i++) {
+                    ASTNode child = (ASTNode) ast.getChild(i);
+                    if (child != null) {
+                        String tokenName = "";
+                        try {
+                            tokenName = HiveParser.tokenNames[child.getType()];
+                        } catch (Exception e) {
+                            tokenName = "UNKNOWN";
+                        }
+                        logger.debug("TOK_UNIONALL: child[" + i + "] type=" + child.getType() +
+                                   " (" + child.getText() + "), tokenName=" + tokenName);
+                    }
+                }
+
+                // 添加调试信息：打印 parseQueryResults 的大小
+                logger.debug("TOK_UNIONALL: parseQueryResults.size()=" + parseQueryResults.size());
+                for (int i = 0; i < parseQueryResults.size(); i++) {
+                    logger.debug("TOK_UNIONALL: parseQueryResults[" + i + "].size()=" + parseQueryResults.get(i).size() +
+                               ", keys=" + parseQueryResults.get(i).keySet());
+                }
+                logger.debug("TOK_UNIONALL: parseUnionColumnResults.size()=" + parseUnionColumnResults.size());
+
                 Map<String, ParseColumnResult> newParseColumnResultMap = new HashMap<>();
                 Map<String, ParseColumnResult> leftParseColumnResultMap;
                 Map<String, ParseColumnResult> RightParseColumnResultMap;
@@ -423,12 +583,20 @@ public class HiveSqlLineageParser {
                 break;
 
             case HiveParser.TOK_QUERY:
+                // 添加调试日志
+                logger.debug("TOK_QUERY: processing, parseSelectResults.size()=" + parseSelectResults.size() +
+                           ", keys=" + parseSelectResults.keySet());
                 Map<String, ParseColumnResult> queryColumnMapTmp = new HashMap<>(parseSelectResults);
                 parseQueryResults.add(queryColumnMapTmp);
                 parseSelectResults.clear();
+                logger.debug("TOK_QUERY: after adding to parseQueryResults, parseQueryResults.size()=" + parseQueryResults.size());
                 break;
 
             case HiveParser.TOK_INSERT:
+                // 添加调试日志
+                logger.debug("TOK_INSERT: processing, parseColumnResults.size()=" + parseColumnResults.size() +
+                           ", parseAllColref.size()=" + parseAllColref.size() +
+                           ", parseSelectResults.size()=" + parseSelectResults.size());
                 if (targetTableColumns.size() > 0) {
                     buildLineageData();
                 } else {
@@ -479,24 +647,169 @@ public class HiveSqlLineageParser {
             case HiveParser.TOK_LEFTOUTERJOIN:
             case HiveParser.TOK_JOIN:
             case HiveParser.TOK_LEFTSEMIJOIN:
-            case HiveParser.TOK_MAPJOIN:
+//            case HiveParser.TOK_MAPJOIN:
             case HiveParser.TOK_FULLOUTERJOIN:
             case HiveParser.TOK_UNIQUEJOIN:
                 ParseJoinResult parseJoinResult = new ParseJoinResult();
 
+                logger.debug("TOK_JOIN: Starting JOIN processing, parseTableResults.size=" + parseTableResults.size() +
+                           ", parseSubQueryResults.size()=" + parseSubQueryResults.size());
+
                 List<ParseTableResult> tableResults = new ArrayList<>(parseTableResults);
                 parseTableResults.clear();
-                parseJoinResult.setParseTableResults(tableResults);
+
+                // 处理表结果：如果表名匹配子查询别名，则创建映射的子查询结果
+                List<ParseSubQueryResult> mappedSubQueryResults = new ArrayList<>();
+
+                for (ParseTableResult tableResult : tableResults) {
+                    boolean isMapped = false;
+                    String tableName = tableResult.getTableName();
+                    String tableAlias = tableResult.getAliasName();
+                    String subQueryRef = tableResult.getSubQueryRef();
+
+                    logger.debug("TOK_JOIN: Processing tableResult - tableName=" + tableName + ", tableAlias=" + tableAlias + ", subQueryRef=" + subQueryRef);
+
+                    // 首先检查是否有子查询引用（subQueryRef 字段）
+                    if (subQueryRef != null && !subQueryRef.isEmpty()) {
+                        // 首先检查是否是 CTE 引用
+                        for (ParseWithResult parseWithResult : parseWithResults) {
+                            if (parseWithResult.getTableName().equals(subQueryRef)) {
+                                // 找到匹配的 CTE，创建一个新的子查询结果，使用 TOK_TABREF 的别名
+                                ParseSubQueryResult mappedSubQuery = new ParseSubQueryResult();
+                                mappedSubQuery.setAliasName(tableAlias);  // 使用 TOK_TABREF 的别名
+
+                                // 复制字段信息
+                                Map<String, ParseColumnResult> newParseSubQueryResults = new HashMap<>();
+                                for (Map.Entry<String, ParseColumnResult> entry : parseWithResult.getParseSubQueryResults().entrySet()) {
+                                    ParseColumnResult original = entry.getValue();
+                                    ParseColumnResult copy = new ParseColumnResult();
+                                    copy.setAliasName(original.getAliasName());
+                                    copy.setIndex(original.getIndex());
+                                    copy.setFromTableColumnSet(new HashSet<>(original.getFromTableColumnSet()));
+                                    copy.setAggregate(original.isAggregate());
+                                    newParseSubQueryResults.put(entry.getKey(), copy);
+                                }
+                                mappedSubQuery.setParseSubQueryResults(newParseSubQueryResults);
+
+                                mappedSubQueryResults.add(mappedSubQuery);
+                                isMapped = true;
+
+                                logger.debug("TOK_JOIN: Mapped CTE via subQueryRef " + subQueryRef +
+                                           " to TOK_TABREF alias " + tableAlias +
+                                           ", created " + newParseSubQueryResults.size() + " field mappings");
+                                break;
+                            }
+                        }
+
+                        // 如果不是 CTE，检查是否是普通子查询引用
+                        if (!isMapped) {
+                            for (ParseSubQueryResult subQueryResult : parseSubQueryResults) {
+                                if (subQueryResult.getAliasName().equals(subQueryRef)) {
+                                    // 创建一个新的子查询结果，使用 TOK_TABREF 的别名
+                                    ParseSubQueryResult mappedSubQuery = new ParseSubQueryResult();
+                                    mappedSubQuery.setAliasName(tableAlias);  // 使用 TOK_TABREF 的别名
+
+                                    // 复制字段信息
+                                    Map<String, ParseColumnResult> newParseSubQueryResults = new HashMap<>();
+                                    for (Map.Entry<String, ParseColumnResult> entry : subQueryResult.getParseSubQueryResults().entrySet()) {
+                                        ParseColumnResult original = entry.getValue();
+                                        ParseColumnResult copy = new ParseColumnResult();
+                                        copy.setAliasName(original.getAliasName());
+                                        copy.setIndex(original.getIndex());
+                                        copy.setFromTableColumnSet(new HashSet<>(original.getFromTableColumnSet()));
+                                        copy.setAggregate(original.isAggregate());
+                                        newParseSubQueryResults.put(entry.getKey(), copy);
+                                    }
+                                    mappedSubQuery.setParseSubQueryResults(newParseSubQueryResults);
+
+                                    mappedSubQueryResults.add(mappedSubQuery);
+                                    isMapped = true;
+
+                                    logger.debug("TOK_JOIN: Mapped subquery via subQueryRef " + subQueryRef +
+                                               " to TOK_TABREF alias " + tableAlias +
+                                               ", created " + newParseSubQueryResults.size() + " field mappings");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // 如果没有通过 subQueryRef 映射，检查是否表名/别名匹配子查询别名
+                    if (!isMapped) {
+                        for (ParseSubQueryResult subQueryResult : parseSubQueryResults) {
+                            logger.debug("TOK_JOIN: Checking against subQueryResult - aliasName=" + subQueryResult.getAliasName() +
+                                       ", equals(tableName)? " + subQueryResult.getAliasName().equals(tableName) +
+                                       ", equals(tableAlias)? " + subQueryResult.getAliasName().equals(tableAlias));
+
+                            if (subQueryResult.getAliasName().equals(tableName) ||
+                                subQueryResult.getAliasName().equals(tableAlias)) {
+                                // 找到匹配的子查询，创建一个新的子查询结果，使用 TOK_TABREF 的别名
+                                ParseSubQueryResult mappedSubQuery = new ParseSubQueryResult();
+                                mappedSubQuery.setAliasName(tableAlias);  // 使用 TOK_TABREF 的别名
+
+                                // 复制字段信息
+                                Map<String, ParseColumnResult> newParseSubQueryResults = new HashMap<>();
+                                for (Map.Entry<String, ParseColumnResult> entry : subQueryResult.getParseSubQueryResults().entrySet()) {
+                                    ParseColumnResult original = entry.getValue();
+                                    ParseColumnResult copy = new ParseColumnResult();
+                                    copy.setAliasName(original.getAliasName());
+                                    copy.setIndex(original.getIndex());
+                                    copy.setFromTableColumnSet(new HashSet<>(original.getFromTableColumnSet()));
+                                    copy.setAggregate(original.isAggregate());
+                                    newParseSubQueryResults.put(entry.getKey(), copy);
+                                }
+                                mappedSubQuery.setParseSubQueryResults(newParseSubQueryResults);
+
+                                mappedSubQueryResults.add(mappedSubQuery);
+                                isMapped = true;
+
+                                logger.debug("TOK_JOIN: Mapped subquery alias " + subQueryResult.getAliasName() +
+                                           " to TOK_TABREF alias " + tableAlias +
+                                           ", created " + newParseSubQueryResults.size() + " field mappings");
+                                break;
+                            }
+                        }
+                    }
+
+                    // 如果不是子查询别名，添加到表结果列表
+                    if (!isMapped) {
+                        parseJoinResult.getParseTableResults().add(tableResult);
+                        logger.debug("TOK_JOIN: Added non-mapped table to parseTableResults - tableName=" + tableName);
+                    }
+                }
+
+                logger.debug("TOK_JOIN: After processing tableResults, mappedSubQueryResults.size()=" + mappedSubQueryResults.size() +
+                           ", parseJoinResult.getParseTableResults().size()=" + parseJoinResult.getParseTableResults().size());
+
+                // 添加未映射的子查询结果
+                for (ParseSubQueryResult subQueryResult : parseSubQueryResults) {
+                    boolean alreadyMapped = false;
+                    for (ParseSubQueryResult mapped : mappedSubQueryResults) {
+                        if (mapped.getAliasName().equals(subQueryResult.getAliasName())) {
+                            alreadyMapped = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyMapped) {
+                        mappedSubQueryResults.add(subQueryResult);
+                        logger.debug("TOK_JOIN: Added unmapped subquery - aliasName=" + subQueryResult.getAliasName());
+                    }
+                }
+
+                logger.debug("TOK_JOIN: Final mappedSubQueryResults.size()=" + mappedSubQueryResults.size());
+                for (ParseSubQueryResult psr : mappedSubQueryResults) {
+                    logger.debug("TOK_JOIN:   subquery alias=" + psr.getAliasName() +
+                               ", fieldCount=" + psr.getParseSubQueryResults().size());
+                }
+
+                parseJoinResult.setParseSubQueryResults(mappedSubQueryResults);
 
                 List<ParseJoinResult> joinResults = new ArrayList<>(parseJoinResults);
                 parseJoinResults.clear();
                 parseJoinResult.setParseJoinResults(joinResults);
 
-                List<ParseSubQueryResult> subQueryResults = new ArrayList<>(parseSubQueryResults);
-                parseSubQueryResults.clear();
-                parseJoinResult.setParseSubQueryResults(subQueryResults);
-
                 List<ParseWithResult> withResults = new ArrayList<>(parseWithResults);
+                parseWithResults.clear();
                 parseJoinResult.setParseWithResults(withResults);
 
                 logger.debug("TOK_JOIN: " + parseJoinResult);
@@ -504,19 +817,166 @@ public class HiveSqlLineageParser {
                 break;
 
             case HiveParser.TOK_TABREF:
-                String fromTableName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0));
+                // Null check for AST node structure
+                if (ast.getChild(0) == null) {
+                    logger.warn("TOK_TABREF: ast.getChild(0) is null, skipping");
+                    break;
+                }
+
+                String fromTableName = null;
+                try {
+                    fromTableName = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0));
+                } catch (Exception e) {
+                    logger.error("TOK_TABREF: Error getting fromTableName from ast.getChild(0)", e);
+                    break;
+                }
+
+                // Null check for fromTableName
+                if (fromTableName == null || fromTableName.trim().isEmpty()) {
+                    logger.warn("TOK_TABREF: fromTableName is null or empty, skipping");
+                    break;
+                }
+
                 Boolean isWithTable = Boolean.FALSE;
-                for (ParseWithResult parseWithResult : parseWithResults) {
-                    if (parseWithResult.getTableName().equals(fromTableName)) {
-                        isWithTable = Boolean.TRUE;
-                        if (ast.getChild(1) != null) {
-                            String withTableAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(1));
-                            parseWithResult.setAliasName(withTableAlias);
+                Boolean isSubQueryAlias = Boolean.FALSE;
+                String referencedSubQueryAlias = null;
+
+                // 获取表名（第一个子节点的第一个子节点）
+                // Null check for nested child node
+                if (ast.getChild(0).getChild(0) == null) {
+                    logger.warn("TOK_TABREF: ast.getChild(0).getChild(0) is null for table=" + fromTableName + ", skipping");
+                    break;
+                }
+
+                String tableNameOrAlias = null;
+                try {
+                    tableNameOrAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(0).getChild(0));
+                } catch (Exception e) {
+                    logger.error("TOK_TABREF: Error getting tableNameOrAlias from ast.getChild(0).getChild(0) for table=" + fromTableName, e);
+                    break;
+                }
+
+                // Null check for tableNameOrAlias
+                if (tableNameOrAlias == null || tableNameOrAlias.trim().isEmpty()) {
+                    logger.warn("TOK_TABREF: tableNameOrAlias is null or empty for table=" + fromTableName + ", skipping");
+                    break;
+                }
+
+                // 获取别名（用于后续检查）
+                String tabrefAlias = null;
+                if (ast.getChild(1) != null) {
+                    try {
+                        tabrefAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(1));
+                    } catch (Exception e) {
+                        logger.error("TOK_TABREF: Error getting tabrefAlias from ast.getChild(1)", e);
+                    }
+                } else if (ast.getChild(0).getChildCount() == 1) {
+                    // 如果没有明确的别名，且只有表名（无数据库名），则使用表名作为别名
+                    tabrefAlias = tableNameOrAlias;
+                }
+
+                // 首先检查是否是 CTE
+                if (parseWithResults != null && !parseWithResults.isEmpty()) {
+                    logger.debug("TOK_TABREF: Checking if " + tableNameOrAlias + " is a CTE, parseWithResults.size()=" + parseWithResults.size());
+                    for (ParseWithResult parseWithResult : parseWithResults) {
+                        // Null check for parseWithResult and its tableName
+                        if (parseWithResult == null || parseWithResult.getTableName() == null) {
+                            continue;
                         }
-                        break;
+
+                        String cteTableName = parseWithResult.getTableName();
+                        logger.debug("TOK_TABREF: Comparing " + tableNameOrAlias + " with CTE " + cteTableName);
+                        if (cteTableName.equals(fromTableName) || cteTableName.equals(tableNameOrAlias)) {
+                            isWithTable = Boolean.TRUE;
+                            // 获取或生成别名
+                            String finalAlias = tabrefAlias != null ? tabrefAlias : tableNameOrAlias;
+
+                            if (ast.getChild(1) != null) {
+                                String withTableAlias = BaseSemanticAnalyzer.getUnescapedName((ASTNode) ast.getChild(1));
+                                parseWithResult.setAliasName(withTableAlias);
+                                finalAlias = withTableAlias;
+                            }
+
+                            // 创建 ParseTableResult 用于 CTE 引用
+                            ParseTableResult cteTableResult = new ParseTableResult();
+                            cteTableResult.setAliasName(finalAlias);
+                            cteTableResult.setDbName("cte");
+                            cteTableResult.setTableName("cte");
+                            cteTableResult.setTableFullName("cte." + finalAlias);
+                            cteTableResult.setColumnNameList(new ArrayList<>());
+                            // 存储原始 CTE 别名引用
+                            cteTableResult.setSubQueryRef(cteTableName);
+                            logger.debug("TOK_TABREF: Created ParseTableResult for CTE with alias=" + finalAlias + ", cteRef=" + cteTableName);
+                            parseTableResults.add(cteTableResult);
+                            break;
+                        }
                     }
                 }
-                if (!isWithTable) {
+
+                // 如果不是 CTE，检查 processedSubQueries（已处理的子查询）
+                if (!isWithTable && !processedSubQueries.isEmpty()) {
+                    logger.debug("TOK_TABREF: Not a CTE, checking processedSubQueries for " + tableNameOrAlias);
+                    if (processedSubQueries.containsKey(tableNameOrAlias)) {
+                        isWithTable = Boolean.TRUE;
+                        isSubQueryAlias = Boolean.TRUE;
+                        referencedSubQueryAlias = tableNameOrAlias;
+
+                        // 创建 ParseTableResult 用于子查询引用
+                        ParseTableResult subQueryTableResult = new ParseTableResult();
+                        String finalAlias = tabrefAlias != null ? tabrefAlias : tableNameOrAlias;
+                        subQueryTableResult.setAliasName(finalAlias);
+                        subQueryTableResult.setDbName("subquery");
+                        subQueryTableResult.setTableName("subquery");
+                        subQueryTableResult.setTableFullName("subquery." + finalAlias);
+                        subQueryTableResult.setColumnNameList(new ArrayList<>());
+                        subQueryTableResult.setSubQueryRef(tableNameOrAlias);
+                        logger.debug("TOK_TABREF: Found in processedSubQueries, created ParseTableResult for subquery with alias=" + finalAlias + ", subQueryRef=" + tableNameOrAlias);
+                        parseTableResults.add(subQueryTableResult);
+                    }
+                }
+
+                // 如果不是 CTE，检查是否是子查询别名
+                if (!isWithTable && parseSubQueryResults != null && !parseSubQueryResults.isEmpty()) {
+                    for (ParseSubQueryResult parseSubQueryResult : parseSubQueryResults) {
+                        // Null check for parseSubQueryResult
+                        if (parseSubQueryResult == null || parseSubQueryResult.getAliasName() == null) {
+                            continue;
+                        }
+
+                        String subQueryAliasName = parseSubQueryResult.getAliasName();
+
+                        // 检查子查询别名是否匹配 tabrefAlias 或 tableNameOrAlias
+                        // 注意：如果是 TOK_TABREF "b mf"，则 tabrefAlias="b", tableNameOrAlias="mf"
+                        // 如果 tabrefAlias 匹配一个已有的子查询别名，说明是引用
+                        // 如果 tableNameOrAlias 匹配一个已有的子查询别名，且 tabrefAlias != tableNameOrAlias，说明是别名重映射
+                        boolean matchesTabrefAlias = tabrefAlias != null && subQueryAliasName.equals(tabrefAlias);
+                        boolean matchesTableNameOrAlias = tableNameOrAlias != null && subQueryAliasName.equals(tableNameOrAlias);
+                        boolean isAliasRemapping = matchesTableNameOrAlias && tabrefAlias != null && !tabrefAlias.equals(tableNameOrAlias);
+
+                        if (matchesTabrefAlias || isAliasRemapping) {
+                            isSubQueryAlias = Boolean.TRUE;
+                            referencedSubQueryAlias = subQueryAliasName;
+                            logger.debug("TOK_TABREF: Found subquery alias reference: original=" + subQueryAliasName +
+                                       ", tabrefAlias=" + tabrefAlias + ", tableNameOrAlias=" + tableNameOrAlias);
+
+                            // 创建一个 ParseTableResult，使用 tabrefAlias 作为别名，并存储子查询引用
+                            ParseTableResult parseTableResult = new ParseTableResult();
+                            parseTableResult.setAliasName(tabrefAlias != null ? tabrefAlias : tableNameOrAlias);
+                            parseTableResult.setDbName("subquery");
+                            parseTableResult.setTableName("subquery");
+                            parseTableResult.setTableFullName("subquery." + (tabrefAlias != null ? tabrefAlias : tableNameOrAlias));
+                            parseTableResult.setColumnNameList(new ArrayList<>());
+                            // 存储原始子查询别名引用
+                            parseTableResult.setSubQueryRef(referencedSubQueryAlias);
+                            logger.debug("TOK_TABREF: Created ParseTableResult with alias=" + tabrefAlias + ", subQueryRef=" + referencedSubQueryAlias);
+                            parseTableResults.add(parseTableResult);
+                            break;
+                        }
+                    }
+                }
+
+                // 只有既不是 CTE 也不是子查询别名的情况下，才当作普通表处理
+                if (!isWithTable && !isSubQueryAlias) {
                     fromTables.add(fromTableName);
                     ParseTableResult parseTableResult = processTokTabref(ast);
                     logger.debug("TOK_TABREF: " + parseTableResult);
@@ -526,11 +986,32 @@ public class HiveSqlLineageParser {
 
             case HiveParser.TOK_SELEXPR:
                 int childIndex = ast.getChildIndex();
-                if (ast.getChild(0).getType() == HiveParser.TOK_ALLCOLREF) {
+
+                // 添加调试日志：打印 TOK_SELEXPR 的子节点信息
+                if (ast.getChild(0) != null) {
+                    String childTokenName = "";
+                    try {
+                        childTokenName = HiveParser.tokenNames[ast.getChild(0).getType()];
+                    } catch (Exception e) {
+                        childTokenName = "UNKNOWN";
+                    }
+                    logger.debug("TOK_SELEXPR: child[0] type=" + ast.getChild(0).getType() + " (" + childTokenName + "), text='" + ast.getChild(0).getText() + "'");
+                }
+
+                if (ast.getChild(0).getType() == HiveParser.TOK_ALLCOLREF ||
+                    ast.getChild(0).getType() == HiveParser.TOK_SETCOLREF) {
+                    logger.debug("TOK_SELEXPR: Found " + (ast.getChild(0).getType() == HiveParser.TOK_ALLCOLREF ? "TOK_ALLCOLREF" : "TOK_SETCOLREF") +
+                               ", expanding " + parseFromResult.size() + " fields");
                     for (Map.Entry<String, ParseColumnResult> entry : parseFromResult.entrySet()) {
                         ParseColumnResult parseColumnResult = entry.getValue();
-                        parseColumnResult.setIndex(parseColumnResult.getIndex() + childIndex);
-                        parseAllColref.put(parseColumnResult.getAliasName(), parseColumnResult);
+                        // Create a copy to avoid modifying the original
+                        ParseColumnResult copy = new ParseColumnResult();
+                        copy.setAliasName(parseColumnResult.getAliasName());
+                        copy.setIndex(parseColumnResult.getIndex() + childIndex);
+                        copy.setFromTableColumnSet(new HashSet<>(parseColumnResult.getFromTableColumnSet()));
+                        copy.setAggregate(parseColumnResult.isAggregate());
+                        parseAllColref.put(copy.getAliasName(), copy);
+                        logger.debug("TOK_SELEXPR: Expanded field " + copy.getAliasName() + " at index " + copy.getIndex());
                     }
                 } else {
                     ProcessTokSelexpr processTokSelexpr = new ProcessTokSelexpr();
@@ -675,6 +1156,10 @@ public class HiveSqlLineageParser {
             parseSubQueryResult.setParseSubQueryResults(selectResults);
             logger.debug("TOK_SUBQUERY: " + parseSubQueryResult);
             parseSubQueryResults.add(parseSubQueryResult);
+
+            // 同时将子查询结果存储到 processedSubQueries，以便后续引用
+            processedSubQueries.put(subQueryAliasName, new HashMap<>(selectResults));
+            logger.debug("TOK_SUBQUERY: Added to processedSubQueries with alias " + subQueryAliasName);
         } else {
             parseChildASTNode(ast);
             parseCurrentASTNode(ast);
